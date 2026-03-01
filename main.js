@@ -1253,12 +1253,7 @@ async function handleCommand(client, message) {
   }
 
   if (command === "sticker") {
-    if (isPrivateMessage(message)) {
-      if (!(await isAdminMessage(message))) {
-        await message.reply("Only admin can use this command in DM.");
-        return;
-      }
-    } else if (!ensureGroupOnly(message)) {
+    if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
       return;
     }
     if (!message.hasMedia) {
