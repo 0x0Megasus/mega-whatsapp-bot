@@ -24,6 +24,11 @@ let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
+let latestQrText = null;
+
+function getQrImageUrl(qrText) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
+}
 
 const store = {
   targetGroupIds: [],
@@ -491,6 +496,22 @@ function startHealthServer() {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       const payload = JSON.stringify({ ok: true, botReady });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(payload);
+      return;
+    }
+
+    if (req.url === "/qr") {
+      if (!latestQrText) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, message: "QR not available right now." }));
+        return;
+      }
+      const payload = JSON.stringify({
+        ok: true,
+        qrText: latestQrText,
+        qrImageUrl: getQrImageUrl(latestQrText),
+      });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(payload);
       return;
@@ -1062,7 +1083,10 @@ async function start() {
   });
 
   client.on("qr", (qr) => {
+    latestQrText = qr;
     qrcode.generate(qr, { small: true });
+    console.log(`Open this QR image URL: ${getQrImageUrl(qr)}`);
+    console.log("Or open /qr endpoint on your Railway public URL.");
     console.log("Scan the QR code above in WhatsApp.");
   });
 
