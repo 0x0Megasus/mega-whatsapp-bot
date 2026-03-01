@@ -1,6 +1,7 @@
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const puppeteer = require("puppeteer");
 const qrcode = require("qrcode-terminal");
+const http = require("http");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
@@ -22,6 +23,7 @@ const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
+let botReady = false;
 
 const store = {
   targetGroupIds: [],
@@ -482,6 +484,25 @@ function getHelpText() {
     `${COMMAND_PREFIX}resetstore (admin only)`,
     `${COMMAND_PREFIX}sticker (admin DM only, send with image/video)`,
   ].join("\n");
+}
+
+function startHealthServer() {
+  const port = Number(process.env.PORT || 3000);
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      const payload = JSON.stringify({ ok: true, botReady });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(payload);
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  });
+
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Health server listening on port ${port}`);
+  });
 }
 
 async function handleMafiaCommand(client, message, args, options = {}) {
@@ -1027,6 +1048,7 @@ async function handleGroupJoin(client, notification) {
 async function start() {
   await loadStore();
   configureFfmpegPath();
+  startHealthServer();
 
   const client = new Client({
     authStrategy: new LocalAuth({
@@ -1046,6 +1068,7 @@ async function start() {
 
   client.on("ready", async () => {
     console.log("Bot is ready.");
+    botReady = true;
     await markCurrentMembersAsWelcomed(client);
   });
 
