@@ -247,10 +247,54 @@ function resolveKickTargets(message, args, participantJids = []) {
   for (const token of args) {
     const digits = toDigits(token || "");
     if (!digits) continue;
-    const match = participantJids.find((jid) => jid.startsWith(`${digits}@`));
+    const match = participantJids.find((jid) => {
+      const jidDigits = toDigits(normalizeJid(jid).split("@")[0] || "");
+      return jidDigits === digits || jidDigits.endsWith(digits) || digits.endsWith(jidDigits);
+    });
     if (match) targets.add(match);
   }
   return [...targets].filter((jid) => participantJids.includes(jid));
+}
+
+async function resolveKickTargetsWithContext(message, args, participantJids = []) {
+  const targets = new Set(resolveKickTargets(message, args, participantJids));
+
+  try {
+    const mentions = await message.getMentions();
+    for (const contact of mentions || []) {
+      const mentionJid = normalizeJid(contact?.id?._serialized || "");
+      if (mentionJid && participantJids.includes(mentionJid)) targets.add(mentionJid);
+    }
+  } catch {
+    // Continue with other target detection methods.
+  }
+
+  try {
+    if (message.hasQuotedMsg) {
+      const quoted = await message.getQuotedMessage();
+      const quotedSender = getSenderId(quoted);
+      if (quotedSender && participantJids.includes(quotedSender)) targets.add(quotedSender);
+    }
+  } catch {
+    // Continue with other target detection methods.
+  }
+
+  return [...targets].filter((jid) => participantJids.includes(jid));
+}
+
+function isGroupAdminParticipant(participant) {
+  return Boolean(participant?.isAdmin || participant?.isSuperAdmin);
+}
+
+function getErrorText(error) {
+  if (!error) return "Unknown error";
+  if (typeof error === "string") return error;
+  if (typeof error.message === "string" && error.message.trim()) return error.message.trim();
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 function configureFfmpegPath() {
@@ -1365,27 +1409,54 @@ async function handleCommand(client, message) {
       return;
     }
 
-    if (command === "close") {
-      await chat.setMessagesAdminsOnly(true);
-      await message.reply("Group chat is now closed. Only admins can send messages.");
+    const meJid = normalizeJid(client?.info?.wid?._serialized || "");
+    const meParticipant = (chat.participants || []).find((participant) => {
+      const participantJid = normalizeJid(participant?.id?._serialized || "");
+      return participantJid && participantJid === meJid;
+    });
+    if (!isGroupAdminParticipant(meParticipant)) {
+      await message.reply("I need to be a group admin to run this command.");
       return;
     }
 
-    if (command === "open") {
-      await chat.setMessagesAdminsOnly(false);
-      await message.reply("Group chat is now open for all members.");
-      return;
-    }
+    try {
+      if (command === "close") {
+        const success = await chat.setMessagesAdminsOnly(true);
+        if (success === false) {
+          await message.reply("Failed to close group chat. Check admin permissions and try again.");
+          return;
+        }
+        await message.reply("Group chat is now closed. Only admins can send messages.");
+        return;
+      }
 
-    const participantJids = getGroupParticipantJids(chat);
-    const targets = resolveKickTargets(message, parts, participantJids).filter((jid) => jid !== getSenderId(message));
-    if (!targets.length) {
-      await message.reply(`Use: ${COMMAND_PREFIX}kick @user`);
-      return;
-    }
+      if (command === "open") {
+        const success = await chat.setMessagesAdminsOnly(false);
+        if (success === false) {
+          await message.reply("Failed to open group chat. Check admin permissions and try again.");
+          return;
+        }
+        await message.reply("Group chat is now open for all members.");
+        return;
+      }
 
-    await chat.removeParticipants(targets);
-    await message.reply(`Done. Removed ${targets.length} member(s).`);
+      const participantJids = getGroupParticipantJids(chat);
+      const senderDigits = toDigits(getSenderId(message).split("@")[0] || "");
+      const targets = (await resolveKickTargetsWithContext(message, parts, participantJids)).filter((jid) => {
+        const targetDigits = toDigits(jid.split("@")[0] || "");
+        return !senderDigits || senderDigits !== targetDigits;
+      });
+      if (!targets.length) {
+        await message.reply(`Use: ${COMMAND_PREFIX}kick @user or reply to a user's message with ${COMMAND_PREFIX}kick`);
+        return;
+      }
+
+      await chat.removeParticipants(targets);
+      await message.reply(`Done. Removed ${targets.length} member(s).`);
+    } catch (error) {
+      await message.reply(`Failed to run ${activePrefix}${command}: ${getErrorText(error)}`);
+      console.error("Group management command error:", error);
+    }
     return;
   }
 
@@ -1471,7 +1542,7 @@ async function start() {
       cacheAlbumMediaMessage(message);
       await handleCommand(client, message);
     } catch (error) {
-      console.error("Command error:", error.message);
+      console.error("Command error:", error);
     }
   });
 
