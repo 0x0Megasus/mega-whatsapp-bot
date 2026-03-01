@@ -36,6 +36,7 @@ const store = {
   welcomeState: {},
   games: {
     mafia: {},
+    mind: {},
   },
 };
 
@@ -43,10 +44,55 @@ function resetStoreToDefault() {
   store.targetGroupIds = [];
   store.welcomedUsers = {};
   store.welcomeState = {};
-  store.games = { mafia: {} };
+  store.games = { mafia: {}, mind: {} };
 }
 
 const welcomeEmojis = ["", "🔥", "😎", "🤝", "🌙", "✨"];
+const localRiddleBank = [
+  {
+    question: "I get wetter the more I dry. What am I?",
+    answers: ["towel", "a towel"],
+    hint: "You use it after shower.",
+  },
+  {
+    question: "What has keys but can't open locks?",
+    answers: ["piano", "a piano", "keyboard", "a keyboard"],
+    hint: "It can make music.",
+  },
+  {
+    question: "What has hands but can not clap?",
+    answers: ["clock", "a clock"],
+    hint: "It tells time.",
+  },
+  {
+    question: "What has a face and two hands but no arms or legs?",
+    answers: ["clock", "a clock"],
+    hint: "You check it all day.",
+  },
+];
+
+const localTriviaBank = [
+  {
+    question: "What is the largest ocean on Earth?",
+    answers: ["pacific ocean", "pacific"],
+    hint: "It is west of the Americas.",
+  },
+  {
+    question: "How many continents are there?",
+    answers: ["7", "seven"],
+    hint: "More than 6, less than 8.",
+  },
+  {
+    question: "Which planet is known as the Red Planet?",
+    answers: ["mars"],
+    hint: "Named after a Roman god.",
+  },
+  {
+    question: "What gas do humans need to breathe to live?",
+    answers: ["oxygen"],
+    hint: "O2",
+  },
+];
 
 function normalizeJid(jid = "") {
   return jid.replace(/:\d+@/, "@");
@@ -70,6 +116,110 @@ function shuffleArray(items = []) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
+}
+
+function decodeHtmlEntities(value = "") {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function normalizeAnswer(value = "") {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pickRandom(items = []) {
+  if (!items.length) return null;
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function getMindStore(groupId) {
+  if (!store.games.mind[groupId]) {
+    store.games.mind[groupId] = {
+      current: null,
+      scores: {},
+      streak: {
+        userId: null,
+        count: 0,
+      },
+    };
+  }
+  return store.games.mind[groupId];
+}
+
+function addMindPoints(groupId, playerId, points) {
+  const groupMind = getMindStore(groupId);
+  groupMind.scores[playerId] = (groupMind.scores[playerId] || 0) + points;
+}
+
+async function fetchApiJson(url) {
+  const response = await fetch(url, { method: "GET" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+async function getTriviaQuestion() {
+  try {
+    const data = await fetchApiJson("https://opentdb.com/api.php?amount=1&type=multiple");
+    const item = data?.results?.[0];
+    if (!item?.question || !item?.correct_answer) throw new Error("invalid trivia payload");
+    return {
+      type: "trivia",
+      source: "Open Trivia DB",
+      question: decodeHtmlEntities(item.question),
+      answers: [decodeHtmlEntities(item.correct_answer)],
+      hint: `Category: ${decodeHtmlEntities(item.category || "General")}`,
+    };
+  } catch {
+    const local = pickRandom(localTriviaBank);
+    return {
+      type: "trivia",
+      source: "Local fallback",
+      question: local.question,
+      answers: local.answers,
+      hint: local.hint,
+    };
+  }
+}
+
+async function getRiddleQuestion() {
+  try {
+    const data = await fetchApiJson("https://riddles-api.vercel.app/random");
+    if (!data?.riddle || !data?.answer) throw new Error("invalid riddle payload");
+    return {
+      type: "riddle",
+      source: "Riddles API",
+      question: String(data.riddle).trim(),
+      answers: [String(data.answer).trim()],
+      hint: "Think simple, not deep.",
+    };
+  } catch {
+    const local = pickRandom(localRiddleBank);
+    return {
+      type: "riddle",
+      source: "Local fallback",
+      question: local.question,
+      answers: local.answers,
+      hint: local.hint,
+    };
+  }
+}
+
+function isCorrectMindAnswer(session, input) {
+  const guess = normalizeAnswer(input);
+  if (!guess) return false;
+  return session.answers.some((ans) => {
+    const normalized = normalizeAnswer(ans);
+    return guess === normalized || guess.includes(normalized) || normalized.includes(guess);
+  });
 }
 
 function ensureGroupOnly(message) {
@@ -446,6 +596,7 @@ async function loadStore() {
       const loadedGames = parsed.games || {};
       store.games = {
         mafia: loadedGames.mafia || {},
+        mind: loadedGames.mind || {},
       };
     }
   } catch (error) {
@@ -481,11 +632,170 @@ async function markCurrentMembersAsWelcomed(client) {
   }
 }
 
+function mindHelpText() {
+  return [
+    "*Mind Games* 🧠",
+    `${COMMAND_PREFIX}mind help`,
+    `${COMMAND_PREFIX}mind start (random API game)`,
+    `${COMMAND_PREFIX}mind trivia`,
+    `${COMMAND_PREFIX}mind riddle`,
+    `${COMMAND_PREFIX}mind answer <your answer>`,
+    `${COMMAND_PREFIX}mind hint`,
+    `${COMMAND_PREFIX}mind skip`,
+    `${COMMAND_PREFIX}mind score`,
+    `${COMMAND_PREFIX}mind reset`,
+  ].join("\n");
+}
+
+async function mindScoreboardText(client, groupId) {
+  const groupMind = getMindStore(groupId);
+  const ranking = Object.entries(groupMind.scores).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  if (!ranking.length) return "No scores yet. Start with .mind start ✨";
+
+  const lines = ["*Mind Scoreboard* 🏆"];
+  for (let i = 0; i < ranking.length; i += 1) {
+    const [jid, points] = ranking[i];
+    lines.push(`${i + 1}. ${await formatUser(client, jid)}: ${points} pts`);
+  }
+  return lines.join("\n");
+}
+
+async function startMindSession(message, groupId, mode) {
+  const groupMind = getMindStore(groupId);
+  if (groupMind.current) {
+    await message.reply("A game is already running. Use .mind answer, .mind hint or .mind skip 🎮");
+    return;
+  }
+
+  const session = mode === "riddle" ? await getRiddleQuestion() : await getTriviaQuestion();
+  groupMind.current = {
+    ...session,
+    startedAt: Date.now(),
+  };
+  await saveStore();
+
+  const mood = session.type === "riddle" ? "🧩 Riddle Time" : "🎯 Trivia Time";
+  await message.reply(
+    [
+      `${mood}`,
+      "",
+      `❓ ${session.question}`,
+      "",
+      `Reply with: ${COMMAND_PREFIX}mind answer <text>`,
+      `Source: ${session.source}`,
+    ].join("\n"),
+  );
+}
+
+async function handleMindCommand(client, message, args) {
+  const groupId = message.from;
+  const sender = getSenderId(message);
+  const sub = (args.shift() || "help").toLowerCase();
+  const groupMind = getMindStore(groupId);
+
+  if (sub === "help") {
+    await message.reply(mindHelpText());
+    return;
+  }
+
+  if (sub === "start") {
+    const mode = Math.random() < 0.5 ? "trivia" : "riddle";
+    await startMindSession(message, groupId, mode);
+    return;
+  }
+
+  if (sub === "trivia") {
+    await startMindSession(message, groupId, "trivia");
+    return;
+  }
+
+  if (sub === "riddle") {
+    await startMindSession(message, groupId, "riddle");
+    return;
+  }
+
+  if (sub === "score" || sub === "scores" || sub === "leaderboard") {
+    await message.reply(await mindScoreboardText(client, groupId));
+    return;
+  }
+
+  if (sub === "reset") {
+    groupMind.scores = {};
+    groupMind.streak = { userId: null, count: 0 };
+    await saveStore();
+    await message.reply("Scoreboard reset for this group ✅");
+    return;
+  }
+
+  if (!groupMind.current) {
+    await message.reply(`No active game. Start one with ${COMMAND_PREFIX}mind start ✨`);
+    return;
+  }
+
+  if (sub === "hint") {
+    await message.reply(`💡 Hint: ${groupMind.current.hint || "No hint for this one. Trust your brain."}`);
+    return;
+  }
+
+  if (sub === "skip") {
+    const reveal = groupMind.current.answers[0];
+    groupMind.current = null;
+    groupMind.streak = { userId: null, count: 0 };
+    await saveStore();
+    await message.reply(`⏭️ Skipped. Correct answer was: *${reveal}*`);
+    return;
+  }
+
+  if (sub === "answer") {
+    const guess = args.join(" ").trim();
+    if (!guess) {
+      await message.reply(`Use: ${COMMAND_PREFIX}mind answer <your answer>`);
+      return;
+    }
+
+    if (!isCorrectMindAnswer(groupMind.current, guess)) {
+      await message.reply("❌ Not quite. Try again 🔁");
+      return;
+    }
+
+    const wonType = groupMind.current.type;
+    const basePoints = wonType === "riddle" ? 3 : 2;
+    if (groupMind.streak.userId === sender) {
+      groupMind.streak.count += 1;
+    } else {
+      groupMind.streak.userId = sender;
+      groupMind.streak.count = 1;
+    }
+    const streakBonus = groupMind.streak.count >= 3 ? 1 : 0;
+    const gained = basePoints + streakBonus;
+    addMindPoints(groupId, sender, gained);
+
+    const total = groupMind.scores[sender];
+    const winnerName = await formatUser(client, sender);
+    const answer = groupMind.current.answers[0];
+    groupMind.current = null;
+    await saveStore();
+
+    await message.reply(
+      [
+        `✅ Correct, ${winnerName}!`,
+        `Answer: *${answer}*`,
+        `+${gained} pts (${basePoints} base${streakBonus ? " +1 streak" : ""})`,
+        `Your total: ${total} pts 🏆`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  await message.reply(`Unknown mind command. Use ${COMMAND_PREFIX}mind help`);
+}
+
 function getHelpText() {
   return [
     `*Bot Commands*`,
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}mafia help`,
+    `${COMMAND_PREFIX}mind help`,
     `${COMMAND_PREFIX}resetstore (admin only)`,
     `${COMMAND_PREFIX}sticker (admin DM only, send with image/video)`,
   ].join("\n");
@@ -1011,6 +1321,10 @@ async function handleCommand(client, message) {
   if (isPrivateMessage(message)) {
     if (command === "mafia") {
       await handleMafiaCommand(client, message, parts, { fromPrivate: true });
+      return;
+    }
+    if (command === "mind") {
+      await message.reply(`Use mind games in group chat only: ${COMMAND_PREFIX}mind start`);
     }
     return;
   }
@@ -1029,6 +1343,10 @@ async function handleCommand(client, message) {
   }
   if (command === "mafia") {
     await handleMafiaCommand(client, message, parts);
+    return;
+  }
+  if (command === "mind") {
+    await handleMindCommand(client, message, parts);
     return;
   }
 
