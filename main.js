@@ -36,7 +36,7 @@ const store = {
   welcomeState: {},
   games: {
     mafia: {},
-    mind: {},
+    flag: {},
   },
 };
 
@@ -44,53 +44,42 @@ function resetStoreToDefault() {
   store.targetGroupIds = [];
   store.welcomedUsers = {};
   store.welcomeState = {};
-  store.games = { mafia: {}, mind: {} };
+  store.games = { mafia: {}, flag: {} };
 }
 
 const welcomeEmojis = ["", "🔥", "😎", "🤝", "🌙", "✨"];
-const localRiddleBank = [
+const localFlagBank = [
   {
-    question: "I get wetter the more I dry. What am I?",
-    answers: ["towel", "a towel"],
-    hint: "You use it after shower.",
+    code: "MA",
+    names: ["morocco", "kingdom of morocco", "maroc"],
   },
   {
-    question: "What has keys but can't open locks?",
-    answers: ["piano", "a piano", "keyboard", "a keyboard"],
-    hint: "It can make music.",
+    code: "US",
+    names: ["united states", "usa", "united states of america", "america"],
   },
   {
-    question: "What has hands but can not clap?",
-    answers: ["clock", "a clock"],
-    hint: "It tells time.",
+    code: "GB",
+    names: ["united kingdom", "uk", "great britain", "britain", "england"],
   },
   {
-    question: "What has a face and two hands but no arms or legs?",
-    answers: ["clock", "a clock"],
-    hint: "You check it all day.",
-  },
-];
-
-const localTriviaBank = [
-  {
-    question: "What is the largest ocean on Earth?",
-    answers: ["pacific ocean", "pacific"],
-    hint: "It is west of the Americas.",
+    code: "FR",
+    names: ["france", "french republic"],
   },
   {
-    question: "How many continents are there?",
-    answers: ["7", "seven"],
-    hint: "More than 6, less than 8.",
+    code: "BR",
+    names: ["brazil", "federative republic of brazil"],
   },
   {
-    question: "Which planet is known as the Red Planet?",
-    answers: ["mars"],
-    hint: "Named after a Roman god.",
+    code: "JP",
+    names: ["japan"],
   },
   {
-    question: "What gas do humans need to breathe to live?",
-    answers: ["oxygen"],
-    hint: "O2",
+    code: "CA",
+    names: ["canada"],
+  },
+  {
+    code: "DE",
+    names: ["germany", "federal republic of germany", "deutschland"],
   },
 ];
 
@@ -118,15 +107,6 @@ function shuffleArray(items = []) {
   return arr;
 }
 
-function decodeHtmlEntities(value = "") {
-  return value
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
-
 function normalizeAnswer(value = "") {
   return value
     .toLowerCase()
@@ -141,9 +121,9 @@ function pickRandom(items = []) {
   return items[Math.floor(Math.random() * items.length)];
 }
 
-function getMindStore(groupId) {
-  if (!store.games.mind[groupId]) {
-    store.games.mind[groupId] = {
+function getFlagStore(groupId) {
+  if (!store.games.flag[groupId]) {
+    store.games.flag[groupId] = {
       current: null,
       scores: {},
       streak: {
@@ -152,12 +132,12 @@ function getMindStore(groupId) {
       },
     };
   }
-  return store.games.mind[groupId];
+  return store.games.flag[groupId];
 }
 
-function addMindPoints(groupId, playerId, points) {
-  const groupMind = getMindStore(groupId);
-  groupMind.scores[playerId] = (groupMind.scores[playerId] || 0) + points;
+function addFlagPoints(groupId, playerId, points) {
+  const groupFlag = getFlagStore(groupId);
+  groupFlag.scores[playerId] = (groupFlag.scores[playerId] || 0) + points;
 }
 
 async function fetchApiJson(url) {
@@ -166,59 +146,59 @@ async function fetchApiJson(url) {
   return response.json();
 }
 
-async function getTriviaQuestion() {
+function countryCodeToFlagEmoji(code = "") {
+  const upper = String(code).toUpperCase().trim();
+  if (!/^[A-Z]{2}$/.test(upper)) return "";
+  return [...upper].map((ch) => String.fromCodePoint(127397 + ch.charCodeAt(0))).join("");
+}
+
+function buildCountryAnswers(country) {
+  const names = new Set();
+  if (country?.name?.common) names.add(String(country.name.common));
+  if (country?.name?.official) names.add(String(country.name.official));
+  for (const alt of country?.altSpellings || []) {
+    if (alt) names.add(String(alt));
+  }
+  if (country?.cca2) names.add(String(country.cca2));
+  if (country?.cca3) names.add(String(country.cca3));
+  return [...names].map(normalizeAnswer).filter(Boolean);
+}
+
+async function getFlagQuestion() {
   try {
-    const data = await fetchApiJson("https://opentdb.com/api.php?amount=1&type=multiple");
-    const item = data?.results?.[0];
-    if (!item?.question || !item?.correct_answer) throw new Error("invalid trivia payload");
+    const countries = await fetchApiJson("https://restcountries.com/v3.1/all?fields=name,flag,cca2,cca3,altSpellings");
+    if (!Array.isArray(countries) || !countries.length) throw new Error("invalid countries payload");
+
+    const valid = countries.filter((country) => country?.cca2 && countryCodeToFlagEmoji(country.cca2));
+    const selected = pickRandom(valid);
+    if (!selected) throw new Error("no valid country found");
+
     return {
-      type: "trivia",
-      source: "Open Trivia DB",
-      question: decodeHtmlEntities(item.question),
-      answers: [decodeHtmlEntities(item.correct_answer)],
-      hint: `Category: ${decodeHtmlEntities(item.category || "General")}`,
+      type: "flag",
+      source: "REST Countries",
+      flag: selected.flag || countryCodeToFlagEmoji(selected.cca2),
+      answers: buildCountryAnswers(selected),
+      revealName: selected?.name?.common || selected?.name?.official || selected.cca2,
+      hint: `Starts with: ${(selected?.name?.common || "").charAt(0).toUpperCase()}`,
     };
   } catch {
-    const local = pickRandom(localTriviaBank);
+    const local = pickRandom(localFlagBank);
     return {
-      type: "trivia",
+      type: "flag",
       source: "Local fallback",
-      question: local.question,
-      answers: local.answers,
-      hint: local.hint,
+      flag: countryCodeToFlagEmoji(local.code),
+      answers: local.names.map(normalizeAnswer),
+      revealName: local.names[0],
+      hint: `Starts with: ${local.names[0].charAt(0).toUpperCase()}`,
     };
   }
 }
 
-async function getRiddleQuestion() {
-  try {
-    const data = await fetchApiJson("https://riddles-api.vercel.app/random");
-    if (!data?.riddle || !data?.answer) throw new Error("invalid riddle payload");
-    return {
-      type: "riddle",
-      source: "Riddles API",
-      question: String(data.riddle).trim(),
-      answers: [String(data.answer).trim()],
-      hint: "Think simple, not deep.",
-    };
-  } catch {
-    const local = pickRandom(localRiddleBank);
-    return {
-      type: "riddle",
-      source: "Local fallback",
-      question: local.question,
-      answers: local.answers,
-      hint: local.hint,
-    };
-  }
-}
-
-function isCorrectMindAnswer(session, input) {
+function isCorrectFlagAnswer(session, input) {
   const guess = normalizeAnswer(input);
   if (!guess) return false;
   return session.answers.some((ans) => {
-    const normalized = normalizeAnswer(ans);
-    return guess === normalized || guess.includes(normalized) || normalized.includes(guess);
+    return guess === ans || guess.includes(ans) || ans.includes(guess);
   });
 }
 
@@ -596,7 +576,7 @@ async function loadStore() {
       const loadedGames = parsed.games || {};
       store.games = {
         mafia: loadedGames.mafia || {},
-        mind: loadedGames.mind || {},
+        flag: loadedGames.flag || {},
       };
     }
   } catch (error) {
@@ -632,27 +612,25 @@ async function markCurrentMembersAsWelcomed(client) {
   }
 }
 
-function mindHelpText() {
+function flagHelpText() {
   return [
-    "*Mind Games* 🧠",
-    `${COMMAND_PREFIX}mind help`,
-    `${COMMAND_PREFIX}mind start (random API game)`,
-    `${COMMAND_PREFIX}mind trivia`,
-    `${COMMAND_PREFIX}mind riddle`,
-    `${COMMAND_PREFIX}mind answer <your answer>`,
-    `${COMMAND_PREFIX}mind hint`,
-    `${COMMAND_PREFIX}mind skip`,
-    `${COMMAND_PREFIX}mind score`,
-    `${COMMAND_PREFIX}mind reset`,
+    "*Flag Game* 🚩",
+    `${COMMAND_PREFIX}flag help`,
+    `${COMMAND_PREFIX}flag start`,
+    `${COMMAND_PREFIX}flag answer <country>`,
+    `${COMMAND_PREFIX}flag hint`,
+    `${COMMAND_PREFIX}flag skip`,
+    `${COMMAND_PREFIX}flag score`,
+    `${COMMAND_PREFIX}flag reset`,
   ].join("\n");
 }
 
-async function mindScoreboardText(client, groupId) {
-  const groupMind = getMindStore(groupId);
-  const ranking = Object.entries(groupMind.scores).sort((a, b) => b[1] - a[1]).slice(0, 10);
-  if (!ranking.length) return "No scores yet. Start with .mind start ✨";
+async function flagScoreboardText(client, groupId) {
+  const groupFlag = getFlagStore(groupId);
+  const ranking = Object.entries(groupFlag.scores).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  if (!ranking.length) return `No scores yet. Start with ${COMMAND_PREFIX}flag start ✨`;
 
-  const lines = ["*Mind Scoreboard* 🏆"];
+  const lines = ["*Flag Scoreboard* 🏆"];
   for (let i = 0; i < ranking.length; i += 1) {
     const [jid, points] = ranking[i];
     lines.push(`${i + 1}. ${await formatUser(client, jid)}: ${points} pts`);
@@ -660,134 +638,146 @@ async function mindScoreboardText(client, groupId) {
   return lines.join("\n");
 }
 
-async function startMindSession(message, groupId, mode) {
-  const groupMind = getMindStore(groupId);
-  if (groupMind.current) {
-    await message.reply("A game is already running. Use .mind answer, .mind hint or .mind skip 🎮");
+async function startFlagSession(message, groupId) {
+  const groupFlag = getFlagStore(groupId);
+  if (groupFlag.current) {
+    await message.reply(`A flag round is already running. Use ${COMMAND_PREFIX}flag answer <country> 🎯`);
     return;
   }
 
-  const session = mode === "riddle" ? await getRiddleQuestion() : await getTriviaQuestion();
-  groupMind.current = {
+  const session = await getFlagQuestion();
+  groupFlag.current = {
     ...session,
     startedAt: Date.now(),
   };
   await saveStore();
 
-  const mood = session.type === "riddle" ? "🧩 Riddle Time" : "🎯 Trivia Time";
   await message.reply(
     [
-      `${mood}`,
+      "*Guess The Flag* 🌍",
       "",
-      `❓ ${session.question}`,
+      `🚩 ${session.flag}`,
       "",
-      `Reply with: ${COMMAND_PREFIX}mind answer <text>`,
+      `Type your answer directly in chat, or use ${COMMAND_PREFIX}flag answer <country>`,
       `Source: ${session.source}`,
     ].join("\n"),
   );
 }
 
-async function handleMindCommand(client, message, args) {
+async function resolveFlagGuess(client, message, guess, options = {}) {
+  const { replyOnWrong = false } = options;
   const groupId = message.from;
   const sender = getSenderId(message);
+  const groupFlag = getFlagStore(groupId);
+  if (!groupFlag.current) return false;
+
+  if (!isCorrectFlagAnswer(groupFlag.current, guess)) {
+    if (replyOnWrong) {
+      await message.reply("❌ Nope. Try again.");
+    }
+    return false;
+  }
+
+  if (groupFlag.streak.userId === sender) {
+    groupFlag.streak.count += 1;
+  } else {
+    groupFlag.streak.userId = sender;
+    groupFlag.streak.count = 1;
+  }
+
+  const streakBonus = groupFlag.streak.count >= 3 ? 1 : 0;
+  const gained = 2 + streakBonus;
+  addFlagPoints(groupId, sender, gained);
+
+  const total = groupFlag.scores[sender];
+  const winnerName = await formatUser(client, sender);
+  const answer = groupFlag.current.revealName;
+  groupFlag.current = null;
+  await saveStore();
+
+  await message.reply(
+    [
+      `✅ Correct, ${winnerName}!`,
+      `Country: *${answer}*`,
+      `+${gained} pts${streakBonus ? " (streak bonus)" : ""}`,
+      `Total: ${total} pts 🏆`,
+      `Start next round: ${COMMAND_PREFIX}flag start`,
+    ].join("\n"),
+  );
+  return true;
+}
+
+async function handlePassiveFlagGuess(client, message) {
+  if (isPrivateMessage(message)) return false;
+  if (!ensureGroupOnly(message)) return false;
+  const body = (message.body || "").trim();
+  if (!body) return false;
+  if (body.startsWith(COMMAND_PREFIX)) return false;
+
+  const groupFlag = getFlagStore(message.from);
+  if (!groupFlag.current) return false;
+  return resolveFlagGuess(client, message, body, { replyOnWrong: false });
+}
+
+async function handleFlagCommand(client, message, args) {
+  const groupId = message.from;
   const sub = (args.shift() || "help").toLowerCase();
-  const groupMind = getMindStore(groupId);
+  const groupFlag = getFlagStore(groupId);
 
   if (sub === "help") {
-    await message.reply(mindHelpText());
+    await message.reply(flagHelpText());
     return;
   }
 
-  if (sub === "start") {
-    const mode = Math.random() < 0.5 ? "trivia" : "riddle";
-    await startMindSession(message, groupId, mode);
-    return;
-  }
-
-  if (sub === "trivia") {
-    await startMindSession(message, groupId, "trivia");
-    return;
-  }
-
-  if (sub === "riddle") {
-    await startMindSession(message, groupId, "riddle");
+  if (sub === "start" || sub === "new") {
+    await startFlagSession(message, groupId);
     return;
   }
 
   if (sub === "score" || sub === "scores" || sub === "leaderboard") {
-    await message.reply(await mindScoreboardText(client, groupId));
+    await message.reply(await flagScoreboardText(client, groupId));
     return;
   }
 
   if (sub === "reset") {
-    groupMind.scores = {};
-    groupMind.streak = { userId: null, count: 0 };
+    groupFlag.scores = {};
+    groupFlag.streak = { userId: null, count: 0 };
+    groupFlag.current = null;
     await saveStore();
-    await message.reply("Scoreboard reset for this group ✅");
+    await message.reply("Flag scoreboard reset for this group ✅");
     return;
   }
 
-  if (!groupMind.current) {
-    await message.reply(`No active game. Start one with ${COMMAND_PREFIX}mind start ✨`);
+  if (!groupFlag.current) {
+    await message.reply(`No active round. Start one with ${COMMAND_PREFIX}flag start ✨`);
     return;
   }
 
   if (sub === "hint") {
-    await message.reply(`💡 Hint: ${groupMind.current.hint || "No hint for this one. Trust your brain."}`);
+    await message.reply(`💡 Hint: ${groupFlag.current.hint || "No hint available."}`);
     return;
   }
 
   if (sub === "skip") {
-    const reveal = groupMind.current.answers[0];
-    groupMind.current = null;
-    groupMind.streak = { userId: null, count: 0 };
+    const reveal = groupFlag.current.revealName;
+    groupFlag.current = null;
+    groupFlag.streak = { userId: null, count: 0 };
     await saveStore();
-    await message.reply(`⏭️ Skipped. Correct answer was: *${reveal}*`);
+    await message.reply(`⏭️ Skipped. Answer was: *${reveal}*`);
     return;
   }
 
   if (sub === "answer") {
     const guess = args.join(" ").trim();
     if (!guess) {
-      await message.reply(`Use: ${COMMAND_PREFIX}mind answer <your answer>`);
+      await message.reply(`Use: ${COMMAND_PREFIX}flag answer <country>`);
       return;
     }
-
-    if (!isCorrectMindAnswer(groupMind.current, guess)) {
-      await message.reply("❌ Not quite. Try again 🔁");
-      return;
-    }
-
-    const wonType = groupMind.current.type;
-    const basePoints = wonType === "riddle" ? 3 : 2;
-    if (groupMind.streak.userId === sender) {
-      groupMind.streak.count += 1;
-    } else {
-      groupMind.streak.userId = sender;
-      groupMind.streak.count = 1;
-    }
-    const streakBonus = groupMind.streak.count >= 3 ? 1 : 0;
-    const gained = basePoints + streakBonus;
-    addMindPoints(groupId, sender, gained);
-
-    const total = groupMind.scores[sender];
-    const winnerName = await formatUser(client, sender);
-    const answer = groupMind.current.answers[0];
-    groupMind.current = null;
-    await saveStore();
-
-    await message.reply(
-      [
-        `✅ Correct, ${winnerName}!`,
-        `Answer: *${answer}*`,
-        `+${gained} pts (${basePoints} base${streakBonus ? " +1 streak" : ""})`,
-        `Your total: ${total} pts 🏆`,
-      ].join("\n"),
-    );
+    await resolveFlagGuess(client, message, guess, { replyOnWrong: true });
     return;
   }
 
-  await message.reply(`Unknown mind command. Use ${COMMAND_PREFIX}mind help`);
+  await message.reply(`Unknown flag command. Use ${COMMAND_PREFIX}flag help`);
 }
 
 function getHelpText() {
@@ -795,7 +785,7 @@ function getHelpText() {
     `*Bot Commands*`,
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}mafia help`,
-    `${COMMAND_PREFIX}mind help`,
+    `${COMMAND_PREFIX}flag help`,
     `${COMMAND_PREFIX}resetstore (admin only)`,
     `${COMMAND_PREFIX}sticker (admin DM only, send with image/video)`,
   ].join("\n");
@@ -1242,7 +1232,10 @@ async function handleMafiaCommand(client, message, args, options = {}) {
 
 async function handleCommand(client, message) {
   const body = (message.body || "").trim();
-  if (!body.startsWith(COMMAND_PREFIX)) return;
+  if (!body.startsWith(COMMAND_PREFIX)) {
+    await handlePassiveFlagGuess(client, message);
+    return;
+  }
 
   const parts = body.slice(COMMAND_PREFIX.length).trim().split(/\s+/);
   const command = (parts.shift() || "").toLowerCase();
@@ -1323,8 +1316,8 @@ async function handleCommand(client, message) {
       await handleMafiaCommand(client, message, parts, { fromPrivate: true });
       return;
     }
-    if (command === "mind") {
-      await message.reply(`Use mind games in group chat only: ${COMMAND_PREFIX}mind start`);
+    if (command === "flag") {
+      await message.reply(`Use flag game in group chat only: ${COMMAND_PREFIX}flag start`);
     }
     return;
   }
@@ -1345,8 +1338,8 @@ async function handleCommand(client, message) {
     await handleMafiaCommand(client, message, parts);
     return;
   }
-  if (command === "mind") {
-    await handleMindCommand(client, message, parts);
+  if (command === "flag") {
+    await handleFlagCommand(client, message, parts);
     return;
   }
 
