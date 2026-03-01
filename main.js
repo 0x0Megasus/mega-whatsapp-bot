@@ -236,6 +236,23 @@ async function isAdminMessage(message) {
   return false;
 }
 
+function getGroupParticipantJids(chat) {
+  return (chat?.participants || [])
+    .map((participant) => normalizeJid(participant?.id?._serialized || ""))
+    .filter(Boolean);
+}
+
+function resolveKickTargets(message, args, participantJids = []) {
+  const targets = new Set((message.mentionedIds || []).map(normalizeJid));
+  for (const token of args) {
+    const digits = toDigits(token || "");
+    if (!digits) continue;
+    const match = participantJids.find((jid) => jid.startsWith(`${digits}@`));
+    if (match) targets.add(match);
+  }
+  return [...targets].filter((jid) => participantJids.includes(jid));
+}
+
 function configureFfmpegPath() {
   try {
     const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
@@ -786,6 +803,9 @@ function getHelpText() {
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}mafia help`,
     `${COMMAND_PREFIX}flag help`,
+    `${COMMAND_PREFIX}kick @user (owner only, group only)`,
+    `${COMMAND_PREFIX}close (owner only, group only)`,
+    `${COMMAND_PREFIX}open (owner only, group only)`,
     `${COMMAND_PREFIX}resetstore (admin only)`,
     `${COMMAND_PREFIX}sticker (admin DM only, send with image/video)`,
   ].join("\n");
@@ -1232,14 +1252,22 @@ async function handleMafiaCommand(client, message, args, options = {}) {
 
 async function handleCommand(client, message) {
   const body = (message.body || "").trim();
-  if (!body.startsWith(COMMAND_PREFIX)) {
+  const usesDefaultPrefix = body.startsWith(COMMAND_PREFIX);
+  const usesPlusPrefix = body.startsWith("+");
+  if (!usesDefaultPrefix && !usesPlusPrefix) {
     await handlePassiveFlagGuess(client, message);
     return;
   }
 
-  const parts = body.slice(COMMAND_PREFIX.length).trim().split(/\s+/);
+  const activePrefix = usesDefaultPrefix ? COMMAND_PREFIX : "+";
+  const parts = body.slice(activePrefix.length).trim().split(/\s+/);
   const command = (parts.shift() || "").toLowerCase();
   if (!command) return;
+  const isPlusAliasCommand = usesPlusPrefix && !usesDefaultPrefix && ["kick", "close", "open"].includes(command);
+  if (usesPlusPrefix && !usesDefaultPrefix && !isPlusAliasCommand) {
+    await handlePassiveFlagGuess(client, message);
+    return;
+  }
 
   if (command === "resetstore") {
     if (!(await isAdminMessage(message))) {
@@ -1324,6 +1352,42 @@ async function handleCommand(client, message) {
   }
 
   if (!ensureGroupOnly(message)) return;
+
+  if (command === "kick" || command === "close" || command === "open") {
+    if (!(await isAdminMessage(message))) {
+      await message.reply("Only bot owner can use this command.");
+      return;
+    }
+
+    const chat = await message.getChat();
+    if (!chat?.isGroup) {
+      await message.reply("This command works in group chats only.");
+      return;
+    }
+
+    if (command === "close") {
+      await chat.setMessagesAdminsOnly(true);
+      await message.reply("Group chat is now closed. Only admins can send messages.");
+      return;
+    }
+
+    if (command === "open") {
+      await chat.setMessagesAdminsOnly(false);
+      await message.reply("Group chat is now open for all members.");
+      return;
+    }
+
+    const participantJids = getGroupParticipantJids(chat);
+    const targets = resolveKickTargets(message, parts, participantJids).filter((jid) => jid !== getSenderId(message));
+    if (!targets.length) {
+      await message.reply(`Use: ${COMMAND_PREFIX}kick @user`);
+      return;
+    }
+
+    await chat.removeParticipants(targets);
+    await message.reply(`Done. Removed ${targets.length} member(s).`);
+    return;
+  }
 
   if (command === "help") {
     await message.reply(getHelpText());
