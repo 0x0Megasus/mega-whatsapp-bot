@@ -24,11 +24,14 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || "";
+const YTDLP_COOKIES_B64 = process.env.YTDLP_COOKIES_B64 || "";
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
+let ytDlpCookiesTempPath = null;
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -693,8 +696,9 @@ function flagHelpText() {
 async function searchYouTubeSong(query) {
   const result = await ytSearch(query);
   const videos = Array.isArray(result?.videos) ? result.videos : [];
-  const selected = videos.find((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200);
-  return selected || null;
+  return videos
+    .filter((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200)
+    .slice(0, 8);
 }
 
 function formatSongCard(video, requestedBy) {
@@ -811,7 +815,7 @@ function isBotCheckError(error) {
 async function downloadWithYtDlp(videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
-  await youtubedl(videoUrl, {
+  const options = {
     extractAudio: true,
     audioFormat: "mp3",
     audioQuality: "0",
@@ -819,7 +823,31 @@ async function downloadWithYtDlp(videoUrl, outputFile) {
     noWarnings: true,
     preferFreeFormats: true,
     ffmpegLocation: ffmpegPath,
-  });
+  };
+  const cookieFile = await resolveYtDlpCookiesPath();
+  if (cookieFile) {
+    options.cookies = cookieFile;
+  }
+  await youtubedl(videoUrl, options);
+}
+
+async function resolveYtDlpCookiesPath() {
+  if (YTDLP_COOKIES_PATH && fsSync.existsSync(YTDLP_COOKIES_PATH)) return YTDLP_COOKIES_PATH;
+  if (!YTDLP_COOKIES_B64) return null;
+  if (ytDlpCookiesTempPath && fsSync.existsSync(ytDlpCookiesTempPath)) return ytDlpCookiesTempPath;
+
+  try {
+    const tmpDir = path.join(DATA_DIR, "tmp-audio");
+    await fs.mkdir(tmpDir, { recursive: true });
+    const cookiePath = path.join(tmpDir, "yt-dlp-cookies.txt");
+    const decoded = Buffer.from(YTDLP_COOKIES_B64, "base64").toString("utf8");
+    await fs.writeFile(cookiePath, decoded, "utf8");
+    ytDlpCookiesTempPath = cookiePath;
+    return cookiePath;
+  } catch (error) {
+    console.error("Failed to prepare yt-dlp cookies file:", error);
+    return null;
+  }
 }
 
 async function handleSongCommand(client, message, args) {
@@ -833,35 +861,60 @@ async function handleSongCommand(client, message, args) {
   const requestedBy = await formatUser(client, getSenderId(message));
 
   try {
-    const video = await searchYouTubeSong(query);
-    if (!video) {
+    const videos = await searchYouTubeSong(query);
+    if (!videos.length) {
       await message.reply("No YouTube result found for that query.");
       return;
     }
 
-    await message.reply(formatSongCard(video, requestedBy));
     const tmpDir = path.join(DATA_DIR, "tmp-audio");
     await fs.mkdir(tmpDir, { recursive: true });
-    const outputFile = path.join(
-      tmpDir,
-      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
-    );
+    let delivered = false;
+    let lastError = null;
 
-    try {
-      await downloadYoutubeAudioAsMp3(video.url, outputFile);
-    } catch (error) {
-      if (!isBotCheckError(error)) throw error;
-      await message.reply("Primary YouTube stream blocked. Retrying with fallback downloader...");
-      await downloadWithYtDlp(video.url, outputFile);
+    for (const video of videos) {
+      const outputFile = path.join(
+        tmpDir,
+        `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
+      );
+
+      try {
+        await message.reply(formatSongCard(video, requestedBy));
+        try {
+          await downloadYoutubeAudioAsMp3(video.url, outputFile);
+        } catch (error) {
+          if (!isBotCheckError(error)) throw error;
+          await downloadWithYtDlp(video.url, outputFile);
+        }
+
+        const media = MessageMedia.fromFilePath(outputFile);
+        await client.sendMessage(message.from, media, {
+          sendAudioAsVoice: false,
+          caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
+        });
+        await fs.unlink(outputFile).catch(() => {});
+        delivered = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        await fs.unlink(outputFile).catch(() => {});
+        if (!isBotCheckError(error)) {
+          throw error;
+        }
+      }
     }
-    const media = MessageMedia.fromFilePath(outputFile);
-    await client.sendMessage(message.from, media, {
-      sendAudioAsVoice: false,
-      caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
-    });
-    await fs.unlink(outputFile).catch(() => {});
+
+    if (!delivered) {
+      throw lastError || new Error("All candidate videos were blocked by YouTube.");
+    }
   } catch (error) {
-    await message.reply(`Song request failed: ${getErrorText(error)}`);
+    if (isBotCheckError(error)) {
+      await message.reply(
+        "Song request failed because YouTube blocked anonymous download. Configure YTDLP_COOKIES_PATH or YTDLP_COOKIES_B64 in Railway and retry.",
+      );
+    } else {
+      await message.reply(`Song request failed: ${getErrorText(error)}`);
+    }
     console.error("Song command error:", error);
   }
 }
