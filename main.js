@@ -5,6 +5,9 @@ const http = require("http");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
+const ytdl = require("ytdl-core");
+const fluentFfmpeg = require("fluent-ffmpeg");
+const ffmpegStatic = require("ffmpeg-static");
 
 let WWebJSUtil = null;
 try {
@@ -300,7 +303,9 @@ function getErrorText(error) {
 function configureFfmpegPath() {
   try {
     const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
-    const candidatePath = ffmpegInstaller?.path;
+    const staticPath = typeof ffmpegStatic === "string" ? ffmpegStatic : "";
+    const installerPath = ffmpegInstaller?.path || "";
+    const candidatePath = staticPath && fsSync.existsSync(staticPath) ? staticPath : installerPath;
     if (!candidatePath || !fsSync.existsSync(candidatePath)) throw new Error("ffmpeg binary not found");
 
     ffmpegBinaryPath = candidatePath;
@@ -312,14 +317,9 @@ function configureFfmpegPath() {
       WWebJSUtil.setFfmpegPath(candidatePath);
       configured = true;
     }
-    try {
-      const fluentFfmpeg = require("fluent-ffmpeg");
-      if (fluentFfmpeg?.setFfmpegPath) {
-        fluentFfmpeg.setFfmpegPath(candidatePath);
-        configured = true;
-      }
-    } catch {
-      // Ignore direct fluent-ffmpeg wiring failures.
+    if (fluentFfmpeg?.setFfmpegPath) {
+      fluentFfmpeg.setFfmpegPath(candidatePath);
+      configured = true;
     }
 
     ffmpegConfigured = configured;
@@ -847,12 +847,69 @@ async function handleFlagCommand(client, message, args) {
   await message.reply(`Unknown flag command. Use ${COMMAND_PREFIX}flag help`);
 }
 
+function downloadYouTubeAudio(url, outputPath) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const stream = ytdl(url, { filter: "audioonly", quality: "highestaudio", highWaterMark: 1 << 25 });
+    stream.on("error", done);
+
+    fluentFfmpeg(stream)
+      .audioCodec("libmp3lame")
+      .format("mp3")
+      .save(outputPath)
+      .on("end", () => done())
+      .on("error", (error) => done(error));
+  });
+}
+
+async function handleSongCommand(client, message, args) {
+  const url = args.join(" ").trim();
+  if (!url) {
+    await message.reply(`Use: ${COMMAND_PREFIX}song <youtube-url>`);
+    return;
+  }
+  if (!ytdl.validateURL(url)) {
+    await message.reply(`Please send a valid YouTube URL.\nUse: ${COMMAND_PREFIX}song <youtube-url>`);
+    return;
+  }
+
+  const tmpDir = path.join(DATA_DIR, "tmp-audio");
+  await fs.mkdir(tmpDir, { recursive: true });
+  const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
+
+  try {
+    const info = await ytdl.getBasicInfo(url).catch(() => null);
+    const title = info?.videoDetails?.title || "YouTube audio";
+    await message.reply(`Downloading: ${title}`);
+
+    await downloadYouTubeAudio(url, outputFile);
+    const media = MessageMedia.fromFilePath(outputFile);
+    await client.sendMessage(message.from, media, {
+      sendAudioAsVoice: false,
+      caption: `${title}\n${url}`,
+    });
+  } catch (error) {
+    await message.reply(`Song request failed: ${getErrorText(error)}`);
+    console.error("Song command error:", error);
+  } finally {
+    await fs.unlink(outputFile).catch(() => {});
+  }
+}
+
 function getHelpText() {
   return [
     "*WHATSAPP MEGA BOT*",
     "",
     "Core Commands:",
     `${COMMAND_PREFIX}help`,
+    `${COMMAND_PREFIX}song <youtube-url>`,
     `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
     "",
     "Games:",
@@ -1387,6 +1444,14 @@ async function handleCommand(client, message) {
       await message.reply(`Done. Converted ${successCount}/${totalSources} to stickers.`);
       return;
     }
+    return;
+  }
+
+  if (command === "song") {
+    if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
+      return;
+    }
+    await handleSongCommand(client, message, parts);
     return;
   }
 
