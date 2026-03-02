@@ -6,9 +6,6 @@ const { spawn } = require("child_process");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
-const ytdl = require("@distube/ytdl-core");
-const ytSearch = require("yt-search");
-const youtubedl = require("youtube-dl-exec");
 
 let WWebJSUtil = null;
 try {
@@ -24,14 +21,15 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
-const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || "";
-const YTDLP_COOKIES_B64 = process.env.YTDLP_COOKIES_B64 || "";
+const PIPED_API_BASES = (process.env.PIPED_API_BASES || "https://pipedapi.kavin.rocks,https://piped.video/api/v1")
+  .split(",")
+  .map((item) => item.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
-let ytDlpCookiesTempPath = null;
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -693,12 +691,103 @@ function flagHelpText() {
   ].join("\n");
 }
 
-async function searchYouTubeSong(query) {
-  const result = await ytSearch(query);
-  const videos = Array.isArray(result?.videos) ? result.videos : [];
-  return videos
-    .filter((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200)
+function formatDuration(seconds) {
+  const total = Number(seconds || 0);
+  if (!Number.isFinite(total) || total <= 0) return "Unknown duration";
+  const hrs = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = Math.floor(total % 60);
+  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function extractYouTubeVideoId(input = "") {
+  const value = String(input || "").trim();
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes("youtu.be")) {
+      const id = parsed.pathname.replace(/^\/+/, "").split("/")[0];
+      return id || null;
+    }
+    if (host.includes("youtube.com")) {
+      const fromQuery = parsed.searchParams.get("v");
+      if (fromQuery) return fromQuery;
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      const idx = parts.findIndex((p) => p === "shorts" || p === "embed" || p === "live");
+      if (idx >= 0 && parts[idx + 1]) return parts[idx + 1];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function parseVideoIdFromPipedItem(item = {}) {
+  const rawUrl = String(item?.url || "");
+  const watchMatch = rawUrl.match(/[?&]v=([A-Za-z0-9_-]{6,})/);
+  if (watchMatch?.[1]) return watchMatch[1];
+  const shortMatch = rawUrl.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/);
+  if (shortMatch?.[1]) return shortMatch[1];
+  const id = String(item?.id || item?.videoId || "");
+  return id || null;
+}
+
+async function fetchPipedJson(endpointPath) {
+  let lastError = null;
+  for (const base of PIPED_API_BASES) {
+    const url = `${base}${endpointPath}`;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("All free music API endpoints failed.");
+}
+
+async function searchSongCandidates(query) {
+  const payload = await fetchPipedJson(`/search?q=${encodeURIComponent(query)}&filter=videos`);
+  const items = Array.isArray(payload) ? payload : [];
+  return items
+    .map((item) => {
+      const videoId = parseVideoIdFromPipedItem(item);
+      if (!videoId) return null;
+      const durationSeconds = Number(item?.duration || item?.lengthSeconds || 0);
+      if (durationSeconds > 0 && durationSeconds > 1200) return null;
+      return {
+        videoId,
+        title: item?.title || "Unknown title",
+        author: { name: item?.uploaderName || item?.uploader || "Unknown artist" },
+        timestamp: formatDuration(durationSeconds),
+        url: `https://youtube.com/watch?v=${videoId}`,
+      };
+    })
+    .filter(Boolean)
     .slice(0, 6);
+}
+
+function pickBestAudioStream(audioStreams = []) {
+  if (!Array.isArray(audioStreams) || !audioStreams.length) return null;
+  const valid = audioStreams.filter((item) => item?.url);
+  if (!valid.length) return null;
+  valid.sort((a, b) => Number(b?.bitrate || 0) - Number(a?.bitrate || 0));
+  return valid[0];
+}
+
+async function resolveSongAudioUrl(videoId) {
+  const payload = await fetchPipedJson(`/streams/${encodeURIComponent(videoId)}`);
+  const stream = pickBestAudioStream(payload?.audioStreams || []);
+  if (!stream?.url) throw new Error("No downloadable audio stream found.");
+  return {
+    audioUrl: stream.url,
+    title: payload?.title || "",
+    authorName: payload?.uploader || payload?.uploaderName || "",
+    duration: formatDuration(Number(payload?.duration || 0)),
+  };
 }
 
 function formatSongCard(video, requestedBy) {
@@ -721,257 +810,6 @@ function getFfmpegExecutable() {
   if (ffmpegBinaryPath && fsSync.existsSync(ffmpegBinaryPath)) return ffmpegBinaryPath;
   if (process.env.FFMPEG_PATH && fsSync.existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
   return "ffmpeg";
-}
-
-async function downloadYoutubeAudioAsMp3(videoUrl, outputFile) {
-  const ffmpegPath = getFfmpegExecutable();
-  const createAudioStream = async () => {
-    try {
-      return ytdl(videoUrl, {
-        filter: "audioonly",
-        quality: "highestaudio",
-        highWaterMark: 1 << 25,
-        dlChunkSize: 0,
-      });
-    } catch {
-      const info = await ytdl.getInfo(videoUrl);
-      const format = ytdl.chooseFormat(info.formats, {
-        quality: "highestaudio",
-        filter: "audioonly",
-      });
-      if (!format?.url) {
-        throw new Error("No audio format available for this video.");
-      }
-      return ytdl.downloadFromInfo(info, {
-        format,
-        highWaterMark: 1 << 25,
-        dlChunkSize: 0,
-      });
-    }
-  };
-
-  const audioStream = await createAudioStream();
-
-  await new Promise((resolve, reject) => {
-    let stderr = "";
-    const ffmpeg = spawn(
-      ffmpegPath,
-      [
-        "-y",
-        "-i",
-        "pipe:0",
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-b:a",
-        "192k",
-        outputFile,
-      ],
-      { stdio: ["pipe", "ignore", "pipe"] },
-    );
-
-    audioStream.on("error", (error) => {
-      ffmpeg.kill("SIGKILL");
-      reject(error);
-    });
-
-    ffmpeg.on("error", (error) => {
-      reject(error);
-    });
-
-    ffmpeg.stderr.on("data", (chunk) => {
-      stderr += String(chunk || "");
-    });
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
-    });
-
-    audioStream.pipe(ffmpeg.stdin);
-  });
-}
-
-function isBotCheckError(error) {
-  const raw = getErrorText(error).toLowerCase();
-  const text = raw
-    .normalize("NFKD")
-    .replace(/[’']/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-  return (
-    text.includes("sign in to confirm you're not a bot") ||
-    text.includes("sign in to confirm you are not a bot") ||
-    text.includes("status code: 410") ||
-    text.includes("unrecoverableerror") ||
-    text.includes("playability") ||
-    (text.includes("sign in") && text.includes("confirm") && text.includes("bot"))
-  );
-}
-
-function isFormatUnavailableError(error) {
-  const text = getErrorText(error)
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[’']/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-  return text.includes("requested format is not available") || text.includes("no video formats found");
-}
-
-function isSkippableSongError(error) {
-  return isFormatUnavailableError(error) || isBotCheckError(error);
-}
-
-async function downloadWithYtDlp(videoUrl, outputFile) {
-  const baseOptions = { ffmpegLocation: getFfmpegExecutable() };
-  const cookieFile = await resolveYtDlpCookiesPath();
-  if (cookieFile) {
-    baseOptions.cookies = cookieFile;
-  }
-
-  try {
-    await downloadWithRawFfmpeg(videoUrl, outputFile, baseOptions);
-    return;
-  } catch (rawError) {
-    if (!isFormatUnavailableError(rawError) && !isBotCheckError(rawError)) {
-      throw rawError;
-    }
-  }
-
-  const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
-  const extractOptions = {
-    extractAudio: true,
-    audioFormat: "mp3",
-    audioQuality: "0",
-    output: outputTemplate,
-    noWarnings: true,
-    ffmpegLocation: baseOptions.ffmpegLocation,
-    cookies: baseOptions.cookies,
-  };
-  const attempts = [
-    { ...extractOptions, format: "bestaudio[ext=m4a]/bestaudio/best" },
-    { ...extractOptions, format: "best" },
-    { ...extractOptions },
-  ];
-
-  let lastError = null;
-  for (const options of attempts) {
-    try {
-      await youtubedl(videoUrl, options);
-      return;
-    } catch (error) {
-      lastError = error;
-      const message = getErrorText(error).toLowerCase();
-      const isFormatError =
-        message.includes("requested format is not available") || message.includes("no video formats found");
-      if (!isFormatError) throw error;
-    }
-  }
-
-  if (lastError && isFormatUnavailableError(lastError)) {
-    await downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions);
-    return;
-  }
-
-  throw lastError || new Error("yt-dlp failed to download this video.");
-}
-
-async function downloadWithRawFfmpeg(videoUrl, outputFile, baseOptions = {}) {
-  const audioUrl = await resolveYtDlpAudioUrl(videoUrl, baseOptions);
-  if (!audioUrl) {
-    throw new Error("No playable audio URL found in yt-dlp metadata.");
-  }
-  await transcodeAudioSourceToMp3(audioUrl, outputFile);
-}
-
-function pickYtDlpAudioUrl(info) {
-  const requested = Array.isArray(info?.requested_downloads) ? info.requested_downloads : [];
-  for (const item of requested) {
-    if (item?.url) return item.url;
-  }
-  if (Array.isArray(info?.formats)) {
-    const audioFormats = info.formats
-      .filter((format) => format?.url)
-      .filter((format) => format?.acodec && format.acodec !== "none")
-      .sort((a, b) => Number(b.abr || 0) - Number(a.abr || 0));
-    if (audioFormats.length) return audioFormats[0].url;
-  }
-  if (info?.url) return info.url;
-  return null;
-}
-
-async function resolveYtDlpAudioUrl(videoUrl, baseOptions = {}) {
-  const attempts = [
-    { client: "android,web,ios,tv_embedded", format: "bestaudio[ext=m4a]/bestaudio/best" },
-    { client: "android,web,ios,tv_embedded", format: "best" },
-    { client: "android,web,ios,tv_embedded", format: null },
-  ];
-
-  let lastError = null;
-  for (const attempt of attempts) {
-    try {
-      const info = await youtubedl(videoUrl, {
-        dumpSingleJson: true,
-        skipDownload: true,
-        noWarnings: true,
-        noPlaylist: true,
-        geoBypass: true,
-        extractorArgs: `youtube:player_client=${attempt.client}`,
-        format: attempt.format || undefined,
-        cookies: baseOptions.cookies,
-      });
-      const url = pickYtDlpAudioUrl(info);
-      if (url) return url;
-      lastError = new Error("No audio URL in yt-dlp metadata.");
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError || new Error("Could not resolve audio URL from yt-dlp.");
-}
-
-async function downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions = {}) {
-  const rawOutputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
-  const rawOptions = {
-    output: rawOutputTemplate,
-    noWarnings: true,
-    ffmpegLocation: baseOptions.ffmpegLocation || getFfmpegExecutable(),
-    format: "bestaudio/best",
-    noPlaylist: true,
-    geoBypass: true,
-  };
-  if (baseOptions.cookies) {
-    rawOptions.cookies = baseOptions.cookies;
-  }
-
-  await youtubedl(videoUrl, rawOptions);
-
-  const dir = path.dirname(outputFile);
-  const baseName = path.basename(outputFile, ".mp3");
-  const files = await fs.readdir(dir);
-  const candidates = files
-    .filter((name) => name.startsWith(`${baseName}.`))
-    .filter((name) => !name.endsWith(".part"))
-    .map((name) => path.join(dir, name));
-
-  if (!candidates.length) {
-    throw new Error("yt-dlp did not produce an audio file.");
-  }
-
-  const sourcePath = candidates.sort((a, b) => b.length - a.length)[0];
-  if (sourcePath.toLowerCase().endsWith(".mp3")) {
-    if (sourcePath !== outputFile) {
-      await fs.rename(sourcePath, outputFile);
-    }
-    return;
-  }
-
-  await transcodeAudioSourceToMp3(sourcePath, outputFile);
-  await fs.unlink(sourcePath).catch(() => {});
 }
 
 async function transcodeAudioSourceToMp3(sourcePath, outputFile) {
@@ -1008,25 +846,6 @@ async function transcodeAudioSourceToMp3(sourcePath, outputFile) {
   });
 }
 
-async function resolveYtDlpCookiesPath() {
-  if (YTDLP_COOKIES_PATH && fsSync.existsSync(YTDLP_COOKIES_PATH)) return YTDLP_COOKIES_PATH;
-  if (!YTDLP_COOKIES_B64) return null;
-  if (ytDlpCookiesTempPath && fsSync.existsSync(ytDlpCookiesTempPath)) return ytDlpCookiesTempPath;
-
-  try {
-    const tmpDir = path.join(DATA_DIR, "tmp-audio");
-    await fs.mkdir(tmpDir, { recursive: true });
-    const cookiePath = path.join(tmpDir, "yt-dlp-cookies.txt");
-    const decoded = Buffer.from(YTDLP_COOKIES_B64, "base64").toString("utf8");
-    await fs.writeFile(cookiePath, decoded, "utf8");
-    ytDlpCookiesTempPath = cookiePath;
-    return cookiePath;
-  } catch (error) {
-    console.error("Failed to prepare yt-dlp cookies file:", error);
-    return null;
-  }
-}
-
 async function handleSongCommand(client, message, args) {
   const query = args.join(" ").trim();
   if (!query) {
@@ -1036,41 +855,29 @@ async function handleSongCommand(client, message, args) {
   const requestedBy = await formatUser(client, getSenderId(message));
 
   try {
-    const tmpDir = path.join(DATA_DIR, "tmp-audio");
-    await fs.mkdir(tmpDir, { recursive: true });
     let candidates = [];
-    if (ytdl.validateURL(query)) {
-      try {
-        const info = await ytdl.getBasicInfo(query);
-        candidates = [
-          {
-            title: info?.videoDetails?.title || "Unknown title",
-            author: { name: info?.videoDetails?.author?.name || "Unknown artist" },
-            timestamp: "Unknown duration",
-            url: query,
-            videoId: info?.videoDetails?.videoId || "",
-          },
-        ];
-      } catch {
-        candidates = [
-          {
-            title: "Unknown title",
-            author: { name: "Unknown artist" },
-            timestamp: "Unknown duration",
-            url: query,
-            videoId: "",
-          },
-        ];
-      }
+    const directVideoId = extractYouTubeVideoId(query);
+    if (directVideoId) {
+      candidates = [
+        {
+          title: "Unknown title",
+          author: { name: "Unknown artist" },
+          timestamp: "Unknown duration",
+          url: `https://youtube.com/watch?v=${directVideoId}`,
+          videoId: directVideoId,
+        },
+      ];
     } else {
       await message.reply(`Searching for: "${query}"...`);
-      candidates = await searchYouTubeSong(query);
+      candidates = await searchSongCandidates(query);
       if (!candidates.length) {
         await message.reply("No YouTube result found for that query.");
         return;
       }
     }
 
+    const tmpDir = path.join(DATA_DIR, "tmp-audio");
+    await fs.mkdir(tmpDir, { recursive: true });
     let sent = false;
     let lastError = null;
     for (const video of candidates) {
@@ -1078,14 +885,17 @@ async function handleSongCommand(client, message, args) {
         tmpDir,
         `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
       );
-      const videoUrl = video.url || query;
       try {
+        const stream = await resolveSongAudioUrl(video.videoId);
+        if (stream.title) video.title = stream.title;
+        if (stream.authorName) video.author = { name: stream.authorName };
+        if (stream.duration && stream.duration !== "Unknown duration") video.timestamp = stream.duration;
         await message.reply(formatSongCard(video, requestedBy));
-        await downloadWithYtDlp(videoUrl, outputFile);
+        await transcodeAudioSourceToMp3(stream.audioUrl, outputFile);
         const media = MessageMedia.fromFilePath(outputFile);
         await client.sendMessage(message.from, media, {
           sendAudioAsVoice: false,
-          caption: `${video.title || "Song"}\n${videoUrl}`.trim(),
+          caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
         });
         await fs.unlink(outputFile).catch(() => {});
         sent = true;
@@ -1093,7 +903,7 @@ async function handleSongCommand(client, message, args) {
       } catch (error) {
         lastError = error;
         await fs.unlink(outputFile).catch(() => {});
-        if (!isSkippableSongError(error) || ytdl.validateURL(query)) {
+        if (directVideoId) {
           throw error;
         }
       }
@@ -1103,15 +913,7 @@ async function handleSongCommand(client, message, args) {
       throw lastError || new Error("Could not download any matched result.");
     }
   } catch (error) {
-    if (isBotCheckError(error)) {
-      await message.reply(
-        "Song request failed because YouTube blocked anonymous download. Configure YTDLP_COOKIES_PATH or YTDLP_COOKIES_B64 in Railway and retry.",
-      );
-    } else if (isFormatUnavailableError(error)) {
-      await message.reply("Song request failed because this YouTube URL has no downloadable format. Try another song/url.");
-    } else {
-      await message.reply(`Song request failed: ${getErrorText(error)}`);
-    }
+    await message.reply(`Song request failed: ${getErrorText(error)}`);
     console.error("Song command error:", error);
   }
 }
