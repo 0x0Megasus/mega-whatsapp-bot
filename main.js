@@ -1003,19 +1003,20 @@ async function handleSongCommand(client, message, args) {
     await message.reply(`Use: ${COMMAND_PREFIX}song <song name or youtube-url>`);
     return;
   }
-  const isDirectUrl = ytdl.validateURL(input);
-
-  const candidateUrls = await resolveSongInputToUrls(input);
-  if (!candidateUrls.length) {
-    await message.reply("No result found for that song.");
-    return;
-  }
-  const tmpDir = path.join(DATA_DIR, "tmp-audio");
-  await fs.mkdir(tmpDir, { recursive: true });
 
   try {
+    const isDirectUrl = ytdl.validateURL(input);
+    const candidateUrls = await resolveSongInputToUrls(input);
+    if (!candidateUrls.length) {
+      await message.reply("No result found for that song.");
+      return;
+    }
+    const tmpDir = path.join(DATA_DIR, "tmp-audio");
+    await fs.mkdir(tmpDir, { recursive: true });
+
     let sent = false;
     let lastError = null;
+    let formatUnavailableCount = 0;
 
     for (const url of candidateUrls) {
       const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
@@ -1042,6 +1043,9 @@ async function handleSongCommand(client, message, args) {
       } catch (error) {
         lastError = error;
         await fs.unlink(outputFile).catch(() => {});
+        if (isYtDlpFormatUnavailable(error)) {
+          formatUnavailableCount += 1;
+        }
         if (isDirectUrl || !isYtDlpFormatUnavailable(error)) {
           throw error;
         }
@@ -1049,6 +1053,10 @@ async function handleSongCommand(client, message, args) {
     }
 
     if (!sent && lastError) {
+      if (!isDirectUrl && formatUnavailableCount === candidateUrls.length) {
+        await message.reply("Song request failed: all matched YouTube results are missing downloadable formats right now. Try another song or exact URL.");
+        return;
+      }
       throw lastError;
     }
   } catch (error) {
