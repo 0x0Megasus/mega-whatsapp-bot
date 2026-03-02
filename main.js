@@ -24,10 +24,13 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || "";
+const YTDLP_COOKIES_B64 = process.env.YTDLP_COOKIES_B64 || "";
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
+let ytDlpCookiesTempPath = null;
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -864,12 +867,30 @@ function downloadYouTubeAudio(url, outputPath) {
   });
 }
 
+async function resolveYtDlpCookiePath() {
+  if (YTDLP_COOKIES_PATH && fsSync.existsSync(YTDLP_COOKIES_PATH)) return YTDLP_COOKIES_PATH;
+  if (ytDlpCookiesTempPath && fsSync.existsSync(ytDlpCookiesTempPath)) return ytDlpCookiesTempPath;
+  if (!YTDLP_COOKIES_B64) return null;
+
+  try {
+    const cookiePath = path.join(DATA_DIR, "yt-dlp-cookies.txt");
+    const decoded = Buffer.from(YTDLP_COOKIES_B64, "base64").toString("utf8");
+    await fs.writeFile(cookiePath, decoded, "utf8");
+    ytDlpCookiesTempPath = cookiePath;
+    return cookiePath;
+  } catch {
+    throw new Error("Invalid YTDLP_COOKIES_B64. Provide a valid base64-encoded cookies.txt");
+  }
+}
+
 async function resolveSongInputToUrl(inputValue) {
   const raw = String(inputValue || "").trim();
   if (!raw) return null;
   if (ytdl.validateURL(raw)) return raw;
 
   const args = ["--no-warnings", "--no-playlist", "--print", "webpage_url", `ytsearch1:${raw}`];
+  const cookiePath = await resolveYtDlpCookiePath();
+  if (cookiePath) args.push("--cookies", cookiePath);
   return await new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -920,6 +941,8 @@ async function downloadYouTubeAudioWithYtDlp(url, outputPath) {
     "--format",
     "bestaudio/best",
   ];
+  const cookiePath = await resolveYtDlpCookiePath();
+  if (cookiePath) args.push("--cookies", cookiePath);
 
   await new Promise((resolve, reject) => {
     let stderr = "";
