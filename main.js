@@ -23,7 +23,6 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
-let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
@@ -302,10 +301,7 @@ function getErrorText(error) {
 
 function configureFfmpegPath() {
   try {
-    const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
-    const staticPath = typeof ffmpegStatic === "string" ? ffmpegStatic : "";
-    const installerPath = ffmpegInstaller?.path || "";
-    const candidatePath = staticPath && fsSync.existsSync(staticPath) ? staticPath : installerPath;
+    const candidatePath = typeof ffmpegStatic === "string" ? ffmpegStatic : "";
     if (!candidatePath || !fsSync.existsSync(candidatePath)) throw new Error("ffmpeg binary not found");
 
     ffmpegBinaryPath = candidatePath;
@@ -322,14 +318,12 @@ function configureFfmpegPath() {
       configured = true;
     }
 
-    ffmpegConfigured = configured;
     console.log(`FFmpeg configured for sticker conversion: ${candidatePath}`);
     return;
   } catch {
     // Keep fallback behavior for image stickers.
   }
   ffmpegBinaryPath = null;
-  ffmpegConfigured = false;
   console.warn("FFmpeg not configured. Video stickers will fail until FFmpeg is installed.");
 }
 
