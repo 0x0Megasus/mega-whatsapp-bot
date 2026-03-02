@@ -792,8 +792,20 @@ async function downloadYoutubeAudioAsMp3(videoUrl, outputFile) {
 }
 
 function isBotCheckError(error) {
-  const text = getErrorText(error).toLowerCase();
-  return text.includes("sign in to confirm you're not a bot") || text.includes("status code: 410");
+  const raw = getErrorText(error).toLowerCase();
+  const text = raw
+    .normalize("NFKD")
+    .replace(/[’']/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (
+    text.includes("sign in to confirm you're not a bot") ||
+    text.includes("sign in to confirm you are not a bot") ||
+    text.includes("status code: 410") ||
+    text.includes("unrecoverableerror") ||
+    text.includes("playability") ||
+    (text.includes("sign in") && text.includes("confirm") && text.includes("bot"))
+  );
 }
 
 async function downloadWithYtDlp(videoUrl, outputFile) {
