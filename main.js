@@ -792,6 +792,75 @@ async function runYtDlpDownload(target, outputFile, format, cookiePath) {
   });
 }
 
+async function getYtDlpSearchCandidates(query, limit, cookiePath) {
+  const args = ["--flat-playlist", "--print", "id", `ytsearch${limit}:${query}`];
+  if (cookiePath) {
+    args.push("--cookies", cookiePath);
+  }
+
+  return await new Promise((resolve, reject) => {
+    let stderr = "";
+    let stdout = "";
+    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } });
+
+    proc.on("error", (error) => reject(error));
+    proc.stdout.on("data", (chunk) => {
+      stdout += String(chunk || "");
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `yt-dlp search failed with exit code ${code}`));
+        return;
+      }
+      const ids = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => /^[A-Za-z0-9_-]{6,}$/.test(line));
+      const urls = ids.map((id) => `https://www.youtube.com/watch?v=${id}`);
+      resolve(urls);
+    });
+  });
+}
+
+async function getYtDlpVideoMeta(target, cookiePath) {
+  const args = ["--no-warnings", "--no-playlist", "--print", "title", "--print", "uploader", "--print", "duration_string", target];
+  if (cookiePath) {
+    args.push("--cookies", cookiePath);
+  }
+
+  return await new Promise((resolve, reject) => {
+    let stderr = "";
+    let stdout = "";
+    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } });
+
+    proc.on("error", (error) => reject(error));
+    proc.stdout.on("data", (chunk) => {
+      stdout += String(chunk || "");
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `yt-dlp metadata failed with exit code ${code}`));
+        return;
+      }
+      const lines = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      resolve({
+        title: lines[0] || "",
+        uploader: lines[1] || "",
+        duration: lines[2] || "",
+      });
+    });
+  });
+}
+
 async function downloadSongWithYtDlp(inputValue, outputFile, tmpDir) {
   const target = looksLikeUrl(inputValue) ? inputValue : `ytsearch1:${inputValue}`;
   const { cookiePath } = await resolveYtDlpCookiePath(tmpDir);
@@ -830,21 +899,55 @@ async function handleSongCommand(client, message, args) {
     const tmpDir = path.join(DATA_DIR, "tmp-audio");
     await fs.mkdir(tmpDir, { recursive: true });
     const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
+    const { cookiePath } = await resolveYtDlpCookiePath(tmpDir);
 
+    const targets = looksLikeUrl(query) ? [query] : await getYtDlpSearchCandidates(query, 5, cookiePath);
+    if (!targets.length) {
+      await message.reply("No YouTube result found for that query.");
+      return;
+    }
+
+    let seedMeta = null;
+    try {
+      seedMeta = await getYtDlpVideoMeta(targets[0], cookiePath);
+    } catch {
+      seedMeta = null;
+    }
     const seedVideo = {
-      title: query,
-      author: { name: "Unknown artist" },
-      timestamp: "Unknown duration",
-      url: query,
+      title: seedMeta?.title || query,
+      author: { name: seedMeta?.uploader || "Unknown artist" },
+      timestamp: seedMeta?.duration || "Unknown duration",
+      url: targets[0] || query,
     };
     await message.reply(formatSongCard(seedVideo, requestedBy));
+    let selectedUrl = targets[0];
+    let selectedMeta = seedMeta;
+    let lastError = null;
+    for (const targetUrl of targets) {
+      try {
+        try {
+          selectedMeta = await getYtDlpVideoMeta(targetUrl, cookiePath);
+        } catch {
+          selectedMeta = selectedMeta || null;
+        }
+        await downloadSongWithYtDlp(targetUrl, outputFile, tmpDir);
+        selectedUrl = targetUrl;
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!isFormatUnavailableErrorText(getErrorText(error)) || looksLikeUrl(query)) {
+          throw error;
+        }
+      }
+    }
+    if (lastError) throw lastError;
 
-    await downloadSongWithYtDlp(query, outputFile, tmpDir);
     const finalVideo = {
-      title: query,
-      author: { name: "Unknown artist" },
-      timestamp: "Unknown duration",
-      url: query,
+      title: selectedMeta?.title || query,
+      author: { name: selectedMeta?.uploader || "Unknown artist" },
+      timestamp: selectedMeta?.duration || "Unknown duration",
+      url: selectedUrl,
     };
     const media = MessageMedia.fromFilePath(outputFile);
     await client.sendMessage(message.from, media, {
