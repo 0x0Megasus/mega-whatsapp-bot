@@ -822,25 +822,35 @@ function isFormatUnavailableError(error) {
 }
 
 async function downloadWithYtDlp(videoUrl, outputFile) {
-  const ffmpegPath = getFfmpegExecutable();
-  const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
-  const baseOptions = {
-    extractAudio: true,
-    audioFormat: "mp3",
-    audioQuality: "0",
-    output: outputTemplate,
-    noWarnings: true,
-    ffmpegLocation: ffmpegPath,
-  };
+  const baseOptions = { ffmpegLocation: getFfmpegExecutable() };
   const cookieFile = await resolveYtDlpCookiesPath();
   if (cookieFile) {
     baseOptions.cookies = cookieFile;
   }
 
+  try {
+    await downloadWithRawFfmpeg(videoUrl, outputFile, baseOptions);
+    return;
+  } catch (rawError) {
+    if (!isFormatUnavailableError(rawError) && !isBotCheckError(rawError)) {
+      throw rawError;
+    }
+  }
+
+  const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
+  const extractOptions = {
+    extractAudio: true,
+    audioFormat: "mp3",
+    audioQuality: "0",
+    output: outputTemplate,
+    noWarnings: true,
+    ffmpegLocation: baseOptions.ffmpegLocation,
+    cookies: baseOptions.cookies,
+  };
   const attempts = [
-    { ...baseOptions, format: "bestaudio[ext=m4a]/bestaudio/best" },
-    { ...baseOptions, format: "best" },
-    { ...baseOptions },
+    { ...extractOptions, format: "bestaudio[ext=m4a]/bestaudio/best" },
+    { ...extractOptions, format: "best" },
+    { ...extractOptions },
   ];
 
   let lastError = null;
@@ -863,6 +873,60 @@ async function downloadWithYtDlp(videoUrl, outputFile) {
   }
 
   throw lastError || new Error("yt-dlp failed to download this video.");
+}
+
+async function downloadWithRawFfmpeg(videoUrl, outputFile, baseOptions = {}) {
+  const audioUrl = await resolveYtDlpAudioUrl(videoUrl, baseOptions);
+  if (!audioUrl) {
+    throw new Error("No playable audio URL found in yt-dlp metadata.");
+  }
+  await transcodeAudioSourceToMp3(audioUrl, outputFile);
+}
+
+function pickYtDlpAudioUrl(info) {
+  const requested = Array.isArray(info?.requested_downloads) ? info.requested_downloads : [];
+  for (const item of requested) {
+    if (item?.url) return item.url;
+  }
+  if (Array.isArray(info?.formats)) {
+    const audioFormats = info.formats
+      .filter((format) => format?.url)
+      .filter((format) => format?.acodec && format.acodec !== "none")
+      .sort((a, b) => Number(b.abr || 0) - Number(a.abr || 0));
+    if (audioFormats.length) return audioFormats[0].url;
+  }
+  if (info?.url) return info.url;
+  return null;
+}
+
+async function resolveYtDlpAudioUrl(videoUrl, baseOptions = {}) {
+  const attempts = [
+    { client: "android,web,ios,tv_embedded", format: "bestaudio[ext=m4a]/bestaudio/best" },
+    { client: "android,web,ios,tv_embedded", format: "best" },
+    { client: "android,web,ios,tv_embedded", format: null },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const info = await youtubedl(videoUrl, {
+        dumpSingleJson: true,
+        skipDownload: true,
+        noWarnings: true,
+        noPlaylist: true,
+        geoBypass: true,
+        extractorArgs: `youtube:player_client=${attempt.client}`,
+        format: attempt.format || undefined,
+        cookies: baseOptions.cookies,
+      });
+      const url = pickYtDlpAudioUrl(info);
+      if (url) return url;
+      lastError = new Error("No audio URL in yt-dlp metadata.");
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Could not resolve audio URL from yt-dlp.");
 }
 
 async function downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions = {}) {
@@ -901,11 +965,11 @@ async function downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions = {}
     return;
   }
 
-  await transcodeAudioFileToMp3(sourcePath, outputFile);
+  await transcodeAudioSourceToMp3(sourcePath, outputFile);
   await fs.unlink(sourcePath).catch(() => {});
 }
 
-async function transcodeAudioFileToMp3(sourcePath, outputFile) {
+async function transcodeAudioSourceToMp3(sourcePath, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   await new Promise((resolve, reject) => {
     let stderr = "";
@@ -1007,16 +1071,7 @@ async function handleSongCommand(client, message, args) {
       `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
     );
     await message.reply(formatSongCard(video, requestedBy));
-    try {
-      await downloadYoutubeAudioAsMp3(videoUrl, outputFile);
-    } catch (primaryError) {
-      try {
-        await downloadWithYtDlp(videoUrl, outputFile);
-      } catch (fallbackError) {
-        fallbackError.cause = primaryError;
-        throw fallbackError;
-      }
-    }
+    await downloadWithYtDlp(videoUrl, outputFile);
 
     const media = MessageMedia.fromFilePath(outputFile);
     await client.sendMessage(message.from, media, {
