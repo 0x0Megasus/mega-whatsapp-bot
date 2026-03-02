@@ -23,13 +23,30 @@ const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
 const PIPED_API_BASES = (process.env.PIPED_API_BASES || "https://pipedapi.kavin.rocks,https://piped.video/api/v1")
   .split(",")
-  .map((item) => item.trim().replace(/\/+$/, ""))
+  .map((item) => normalizePipedApiBase(item))
   .filter(Boolean);
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
+
+function normalizePipedApiBase(raw = "") {
+  const input = String(raw || "").trim();
+  if (!input) return "";
+
+  const fixedProtocol = input.startsWith("https//") ? input.replace(/^https\/\//, "https://") : input;
+  try {
+    const parsed = new URL(fixedProtocol);
+    const pathName = (parsed.pathname || "").replace(/\/+$/, "");
+    if (pathName.endsWith("/api/v1")) {
+      return `${parsed.origin}${pathName}`;
+    }
+    return `${parsed.origin}/api/v1`;
+  } catch {
+    return "";
+  }
+}
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -741,6 +758,11 @@ async function fetchPipedJson(endpointPath) {
     try {
       const response = await fetch(url);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+      if (!contentType.includes("application/json")) {
+        const bodySnippet = (await response.text()).slice(0, 120).replace(/\s+/g, " ");
+        throw new Error(`Non-JSON response from ${base}: ${bodySnippet}`);
+      }
       return await response.json();
     } catch (error) {
       lastError = error;
@@ -770,26 +792,6 @@ async function searchSongCandidates(query) {
     .slice(0, 6);
 }
 
-function pickBestAudioStream(audioStreams = []) {
-  if (!Array.isArray(audioStreams) || !audioStreams.length) return null;
-  const valid = audioStreams.filter((item) => item?.url);
-  if (!valid.length) return null;
-  valid.sort((a, b) => Number(b?.bitrate || 0) - Number(a?.bitrate || 0));
-  return valid[0];
-}
-
-async function resolveSongAudioUrl(videoId) {
-  const payload = await fetchPipedJson(`/streams/${encodeURIComponent(videoId)}`);
-  const stream = pickBestAudioStream(payload?.audioStreams || []);
-  if (!stream?.url) throw new Error("No downloadable audio stream found.");
-  return {
-    audioUrl: stream.url,
-    title: payload?.title || "",
-    authorName: payload?.uploader || payload?.uploaderName || "",
-    duration: formatDuration(Number(payload?.duration || 0)),
-  };
-}
-
 function formatSongCard(video, requestedBy) {
   const title = video?.title || "Unknown title";
   const author = video?.author?.name || "Unknown artist";
@@ -812,36 +814,56 @@ function getFfmpegExecutable() {
   return "ffmpeg";
 }
 
-async function transcodeAudioSourceToMp3(sourcePath, outputFile) {
+async function downloadSongWithPython(videoUrl, outputFile) {
+  const scriptPath = path.join(__dirname, "scripts", "download_song.py");
+  if (!fsSync.existsSync(scriptPath)) {
+    throw new Error("Python downloader script missing: scripts/download_song.py");
+  }
+
+  const pythonCandidates = [process.env.PYTHON_BIN || "", "python3", "python"].filter(Boolean);
+  let lastError = null;
+  for (const pythonBin of pythonCandidates) {
+    try {
+      await runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Python runtime not found for song downloader.");
+}
+
+async function runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   await new Promise((resolve, reject) => {
     let stderr = "";
-    const ffmpeg = spawn(
-      ffmpegPath,
-      [
-        "-y",
-        "-i",
-        sourcePath,
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-b:a",
-        "192k",
-        outputFile,
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
+    let stdout = "";
+    const proc = spawn(
+      pythonBin,
+      [scriptPath, "--url", videoUrl, "--output", outputFile],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          FFMPEG_BINARY_PATH: ffmpegPath,
+        },
+      },
     );
 
-    ffmpeg.on("error", (error) => reject(error));
-    ffmpeg.stderr.on("data", (chunk) => {
+    proc.on("error", (error) => reject(error));
+    proc.stdout.on("data", (chunk) => {
+      stdout += String(chunk || "");
+    });
+    proc.stderr.on("data", (chunk) => {
       stderr += String(chunk || "");
     });
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
+    proc.on("close", (code) => {
+      if (code === 0 && fsSync.existsSync(outputFile)) {
         resolve();
         return;
       }
-      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+      const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+      reject(new Error(details || `Python downloader failed with exit code ${code}`));
     });
   });
 }
@@ -886,12 +908,8 @@ async function handleSongCommand(client, message, args) {
         `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
       );
       try {
-        const stream = await resolveSongAudioUrl(video.videoId);
-        if (stream.title) video.title = stream.title;
-        if (stream.authorName) video.author = { name: stream.authorName };
-        if (stream.duration && stream.duration !== "Unknown duration") video.timestamp = stream.duration;
         await message.reply(formatSongCard(video, requestedBy));
-        await transcodeAudioSourceToMp3(stream.audioUrl, outputFile);
+        await downloadSongWithPython(video.url, outputFile);
         const media = MessageMedia.fromFilePath(outputFile);
         await client.sendMessage(message.from, media, {
           sendAudioAsVoice: false,
@@ -913,7 +931,15 @@ async function handleSongCommand(client, message, args) {
       throw lastError || new Error("Could not download any matched result.");
     }
   } catch (error) {
-    await message.reply(`Song request failed: ${getErrorText(error)}`);
+    const errText = getErrorText(error);
+    const lower = errText.toLowerCase();
+    if (lower.includes("python runtime not found")) {
+      await message.reply("Song request failed: Python is not available on this server. Install Python 3 and set PYTHON_BIN.");
+    } else if (lower.includes("no module named") && lower.includes("yt_dlp")) {
+      await message.reply("Song request failed: missing Python package yt-dlp. Install with: pip install yt-dlp");
+    } else {
+      await message.reply(`Song request failed: ${errText}`);
+    }
     console.error("Song command error:", error);
   }
 }
