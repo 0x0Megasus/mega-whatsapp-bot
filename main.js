@@ -715,13 +715,16 @@ async function downloadSongWithPython(videoUrl, outputFile) {
     throw new Error("Python downloader script missing: scripts/download_song.py");
   }
 
-  const pythonCandidates = [process.env.PYTHON_BIN || "", "python3", "python"].filter(Boolean);
+  const pythonCandidates = [process.env.PYTHON_BIN || "", "/usr/bin/python3", "python3", "python"].filter(Boolean);
   let lastError = null;
   for (const pythonBin of pythonCandidates) {
     try {
       return await runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile);
     } catch (error) {
       lastError = error;
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
     }
   }
   throw lastError || new Error("Python runtime not found for song downloader.");
@@ -734,7 +737,7 @@ async function runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile) {
     let stdout = "";
     const proc = spawn(
       pythonBin,
-      [scriptPath, "--url", videoUrl, "--output", outputFile],
+      [scriptPath, "--input", videoUrl, "--output", outputFile],
       {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
