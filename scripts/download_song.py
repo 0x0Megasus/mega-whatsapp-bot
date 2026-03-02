@@ -7,9 +7,11 @@ Requires: yt-dlp (apt package or pip install yt-dlp)
 import argparse
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 
 def parse_args():
@@ -17,6 +19,22 @@ def parse_args():
     parser.add_argument("--input", required=True, help="Song name query or YouTube URL")
     parser.add_argument("--output", required=True, help="Absolute output .mp3 file path")
     return parser.parse_args()
+
+
+def resolve_cookie_file():
+    cookies_path = os.getenv("YTDLP_COOKIES_PATH", "").strip()
+    if cookies_path and Path(cookies_path).exists():
+        return cookies_path, None
+
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+    if not cookies_b64:
+        return None, None
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    tmp.write(__import__("base64").b64decode(cookies_b64))
+    tmp.flush()
+    tmp.close()
+    return tmp.name, tmp.name
 
 
 def find_downloaded_file(base_without_ext: Path):
@@ -42,6 +60,7 @@ def main():
         "quiet": True,
         "no_warnings": True,
         "outtmpl": outtmpl,
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "ios", "tv_embedded"]}},
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -52,19 +71,44 @@ def main():
     }
     if ffmpeg_path:
         ydl_opts["ffmpeg_location"] = ffmpeg_path
+    cookie_file, temp_cookie_file = resolve_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     target = args.input.strip()
-    if not target.startswith("http://") and not target.startswith("https://"):
-        target = f"ytsearch1:{target}"
+    is_direct_url = target.startswith("http://") or target.startswith("https://")
+    if not is_direct_url:
+        target = f"ytsearch5:{target}"
 
     info = None
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(target, download=True)
-
-    if isinstance(info, dict) and isinstance(info.get("entries"), list):
-        entries = [e for e in info.get("entries") if e]
-        if entries:
-            info = entries[0]
+    ydl = yt_dlp.YoutubeDL(ydl_opts)
+    try:
+        if is_direct_url:
+            info = ydl.extract_info(target, download=True)
+        else:
+            search_result = ydl.extract_info(target, download=False)
+            entries = [e for e in (search_result or {}).get("entries", []) if e]
+            last_error = None
+            for entry in entries:
+                entry_url = entry.get("webpage_url") or entry.get("url")
+                if not entry_url:
+                    continue
+                try:
+                    info = ydl.extract_info(entry_url, download=True)
+                    if info:
+                        break
+                except DownloadError as err:
+                    last_error = err
+            if info is None and last_error is not None:
+                raise last_error
+            if info is None:
+                raise RuntimeError("No downloadable search results found.")
+    finally:
+        if temp_cookie_file:
+            try:
+                Path(temp_cookie_file).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     downloaded = find_downloaded_file(base)
     if downloaded is None:
