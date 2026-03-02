@@ -21,11 +21,14 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
+const YTDLP_COOKIES_PATH = process.env.YTDLP_COOKIES_PATH || "";
+const YTDLP_COOKIES_B64 = process.env.YTDLP_COOKIES_B64 || "";
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
+let ytDlpCookiesTempPath = null;
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -709,43 +712,67 @@ function getFfmpegExecutable() {
   return "ffmpeg";
 }
 
-async function downloadSongWithPython(videoUrl, outputFile) {
-  const scriptPath = path.join(__dirname, "scripts", "download_song.py");
-  if (!fsSync.existsSync(scriptPath)) {
-    throw new Error("Python downloader script missing: scripts/download_song.py");
-  }
+async function resolveYtDlpCookiePath(tmpDir) {
+  if (YTDLP_COOKIES_PATH && fsSync.existsSync(YTDLP_COOKIES_PATH)) return { cookiePath: YTDLP_COOKIES_PATH };
+  if (!YTDLP_COOKIES_B64) return { cookiePath: null };
+  if (ytDlpCookiesTempPath && fsSync.existsSync(ytDlpCookiesTempPath)) return { cookiePath: ytDlpCookiesTempPath };
 
-  const pythonCandidates = [process.env.PYTHON_BIN || "", "/usr/bin/python3", "python3", "python"].filter(Boolean);
-  let lastError = null;
-  for (const pythonBin of pythonCandidates) {
-    try {
-      return await runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile);
-    } catch (error) {
-      lastError = error;
-      if (error?.code !== "ENOENT") {
-        throw error;
-      }
-    }
-  }
-  throw lastError || new Error("Python runtime not found for song downloader.");
+  const cookiePath = path.join(tmpDir, "yt-dlp-cookies.txt");
+  const decoded = Buffer.from(YTDLP_COOKIES_B64, "base64").toString("utf8");
+  await fs.writeFile(cookiePath, decoded, "utf8");
+  ytDlpCookiesTempPath = cookiePath;
+  return { cookiePath };
 }
 
-async function runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile) {
+function looksLikeUrl(value = "") {
+  return /^https?:\/\//i.test(String(value || "").trim());
+}
+
+function isFormatUnavailableErrorText(text = "") {
+  const normalized = String(text).toLowerCase();
+  return normalized.includes("requested format is not available") || normalized.includes("no video formats found");
+}
+
+async function findDownloadedSongFile(outputFile) {
+  const dir = path.dirname(outputFile);
+  const baseName = path.basename(outputFile, ".mp3");
+  const files = await fs.readdir(dir);
+  const candidates = files
+    .filter((name) => name.startsWith(`${baseName}.`) || name === `${baseName}.mp3`)
+    .filter((name) => !name.endsWith(".part"))
+    .map((name) => path.join(dir, name));
+  if (!candidates.length) return null;
+  const mp3 = candidates.find((p) => p.toLowerCase().endsWith(".mp3"));
+  return mp3 || candidates[0];
+}
+
+async function runYtDlpDownload(target, outputFile, format, cookiePath) {
   const ffmpegPath = getFfmpegExecutable();
+  const outTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
+  const args = [
+    target,
+    "--extract-audio",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "0",
+    "--no-playlist",
+    "--no-warnings",
+    "--ffmpeg-location",
+    ffmpegPath,
+    "--output",
+    outTemplate,
+    "--format",
+    format,
+  ];
+  if (cookiePath) {
+    args.push("--cookies", cookiePath);
+  }
+
   await new Promise((resolve, reject) => {
     let stderr = "";
     let stdout = "";
-    const proc = spawn(
-      pythonBin,
-      [scriptPath, "--input", videoUrl, "--output", outputFile],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          FFMPEG_BINARY_PATH: ffmpegPath,
-        },
-      },
-    );
+    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } });
 
     proc.on("error", (error) => reject(error));
     proc.stdout.on("data", (chunk) => {
@@ -755,27 +782,40 @@ async function runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile) {
       stderr += String(chunk || "");
     });
     proc.on("close", (code) => {
-      if (code === 0 && fsSync.existsSync(outputFile)) {
-        const line = stdout
-          .trim()
-          .split(/\r?\n/)
-          .reverse()
-          .find(Boolean);
-        if (!line) {
-          resolve({ output: outputFile, title: "", uploader: "", webpage_url: "", duration: 0 });
-          return;
-        }
-        try {
-          resolve(JSON.parse(line));
-        } catch {
-          resolve({ output: outputFile, title: "", uploader: "", webpage_url: "", duration: 0 });
-        }
+      if (code === 0) {
+        resolve();
         return;
       }
       const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-      reject(new Error(details || `Python downloader failed with exit code ${code}`));
+      reject(new Error(details || `yt-dlp failed with exit code ${code}`));
     });
   });
+}
+
+async function downloadSongWithYtDlp(inputValue, outputFile, tmpDir) {
+  const target = looksLikeUrl(inputValue) ? inputValue : `ytsearch1:${inputValue}`;
+  const { cookiePath } = await resolveYtDlpCookiePath(tmpDir);
+  const formats = ["bestaudio[ext=m4a]/bestaudio/best", "bestaudio/best", "best"];
+
+  let lastError = null;
+  for (const format of formats) {
+    try {
+      await runYtDlpDownload(target, outputFile, format, cookiePath);
+      const generated = await findDownloadedSongFile(outputFile);
+      if (!generated) throw new Error("yt-dlp completed but no audio file was found.");
+      if (generated !== outputFile) {
+        if (fsSync.existsSync(outputFile)) await fs.unlink(outputFile).catch(() => {});
+        await fs.rename(generated, outputFile);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isFormatUnavailableErrorText(getErrorText(error))) {
+        throw error;
+      }
+    }
+  }
+  throw lastError || new Error("Could not download song with yt-dlp.");
 }
 
 async function handleSongCommand(client, message, args) {
@@ -799,12 +839,12 @@ async function handleSongCommand(client, message, args) {
     };
     await message.reply(formatSongCard(seedVideo, requestedBy));
 
-    const meta = await downloadSongWithPython(query, outputFile);
+    await downloadSongWithYtDlp(query, outputFile, tmpDir);
     const finalVideo = {
-      title: meta?.title || query,
-      author: { name: meta?.uploader || "Unknown artist" },
+      title: query,
+      author: { name: "Unknown artist" },
       timestamp: "Unknown duration",
-      url: meta?.webpage_url || query,
+      url: query,
     };
     const media = MessageMedia.fromFilePath(outputFile);
     await client.sendMessage(message.from, media, {
@@ -814,14 +854,7 @@ async function handleSongCommand(client, message, args) {
     await fs.unlink(outputFile).catch(() => {});
   } catch (error) {
     const errText = getErrorText(error);
-    const lower = errText.toLowerCase();
-    if (lower.includes("python runtime not found")) {
-      await message.reply("Song request failed: Python is not available on this server. Install Python 3 and set PYTHON_BIN.");
-    } else if (lower.includes("no module named") && lower.includes("yt_dlp")) {
-      await message.reply("Song request failed: missing Python package yt-dlp. Install with: pip install yt-dlp");
-    } else {
-      await message.reply(`Song request failed: ${errText}`);
-    }
+    await message.reply(`Song request failed: ${errText}`);
     console.error("Song command error:", error);
   }
 }
