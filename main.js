@@ -1,10 +1,13 @@
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const puppeteer = require("puppeteer");
 const qrcode = require("qrcode-terminal");
 const http = require("http");
+const { spawn } = require("child_process");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
+const ytdl = require("ytdl-core");
+const ytSearch = require("yt-search");
 
 let WWebJSUtil = null;
 try {
@@ -686,6 +689,125 @@ function flagHelpText() {
   ].join("\n");
 }
 
+async function searchYouTubeSong(query) {
+  const result = await ytSearch(query);
+  const videos = Array.isArray(result?.videos) ? result.videos : [];
+  const selected = videos.find((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200);
+  return selected || null;
+}
+
+function formatSongCard(video, requestedBy) {
+  const title = video?.title || "Unknown title";
+  const author = video?.author?.name || "Unknown artist";
+  const duration = video?.timestamp || "Unknown duration";
+  const sourceUrl = video?.url || "Unknown URL";
+  return [
+    "╔════════ SONG RESULT ════════╗",
+    `Title : ${title}`,
+    `Artist: ${author}`,
+    `Length: ${duration}`,
+    `Source: ${sourceUrl}`,
+    `Requested by: ${requestedBy}`,
+    "Downloading MP3...",
+    "╚═════════════════════════════╝",
+  ].join("\n");
+}
+
+function getFfmpegExecutable() {
+  if (ffmpegBinaryPath && fsSync.existsSync(ffmpegBinaryPath)) return ffmpegBinaryPath;
+  if (process.env.FFMPEG_PATH && fsSync.existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
+  return "ffmpeg";
+}
+
+async function downloadYoutubeAudioAsMp3(videoUrl, outputFile) {
+  const ffmpegPath = getFfmpegExecutable();
+  const audioStream = ytdl(videoUrl, {
+    filter: "audioonly",
+    quality: "highestaudio",
+    highWaterMark: 1 << 25,
+  });
+
+  await new Promise((resolve, reject) => {
+    let stderr = "";
+    const ffmpeg = spawn(
+      ffmpegPath,
+      [
+        "-y",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        outputFile,
+      ],
+      { stdio: ["pipe", "ignore", "pipe"] },
+    );
+
+    audioStream.on("error", (error) => {
+      ffmpeg.kill("SIGKILL");
+      reject(error);
+    });
+
+    ffmpeg.on("error", (error) => {
+      reject(error);
+    });
+
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+    });
+
+    audioStream.pipe(ffmpeg.stdin);
+  });
+}
+
+async function handleSongCommand(client, message, args) {
+  const query = args.join(" ").trim();
+  if (!query) {
+    await message.reply(`Use: ${COMMAND_PREFIX}song <song name>`);
+    return;
+  }
+
+  await message.reply(`Searching for: "${query}"...`);
+  const requestedBy = await formatUser(client, getSenderId(message));
+
+  try {
+    const video = await searchYouTubeSong(query);
+    if (!video) {
+      await message.reply("No YouTube result found for that query.");
+      return;
+    }
+
+    await message.reply(formatSongCard(video, requestedBy));
+    const tmpDir = path.join(DATA_DIR, "tmp-audio");
+    await fs.mkdir(tmpDir, { recursive: true });
+    const outputFile = path.join(
+      tmpDir,
+      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
+    );
+
+    await downloadYoutubeAudioAsMp3(video.url, outputFile);
+    const media = MessageMedia.fromFilePath(outputFile);
+    await client.sendMessage(message.from, media, {
+      sendAudioAsVoice: false,
+      caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
+    });
+    await fs.unlink(outputFile).catch(() => {});
+  } catch (error) {
+    await message.reply(`Song request failed: ${getErrorText(error)}`);
+    console.error("Song command error:", error);
+  }
+}
+
 async function flagScoreboardText(client, groupId) {
   const groupFlag = getFlagStore(groupId);
   const ranking = Object.entries(groupFlag.scores).sort((a, b) => b[1] - a[1]).slice(0, 10);
@@ -843,15 +965,22 @@ async function handleFlagCommand(client, message, args) {
 
 function getHelpText() {
   return [
-    `*Bot Commands*`,
+    "╔════════ WHATSAPP MEGA BOT ════════╗",
+    "Core Commands",
     `${COMMAND_PREFIX}help`,
+    `${COMMAND_PREFIX}song <name>`,
+    `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
+    "",
+    "Games",
     `${COMMAND_PREFIX}mafia help`,
     `${COMMAND_PREFIX}flag help`,
-    `${COMMAND_PREFIX}kick @user (owner only, group only)`,
-    `${COMMAND_PREFIX}close (owner only, group only)`,
-    `${COMMAND_PREFIX}open (owner only, group only)`,
-    `${COMMAND_PREFIX}resetstore (admin only)`,
-    `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
+    "",
+    "Owner Commands",
+    `${COMMAND_PREFIX}kick @user (group only)`,
+    `${COMMAND_PREFIX}close (group only)`,
+    `${COMMAND_PREFIX}open (group only)`,
+    `${COMMAND_PREFIX}resetstore`,
+    "╚════════════════════════════════════╝",
   ].join("\n");
 }
 
@@ -1375,6 +1504,14 @@ async function handleCommand(client, message) {
       await message.reply(`Done. Converted ${successCount}/${totalSources} to stickers.`);
       return;
     }
+    return;
+  }
+
+  if (command === "song") {
+    if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
+      return;
+    }
+    await handleSongCommand(client, message, parts);
     return;
   }
 
