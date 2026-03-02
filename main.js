@@ -696,9 +696,8 @@ function flagHelpText() {
 async function searchYouTubeSong(query) {
   const result = await ytSearch(query);
   const videos = Array.isArray(result?.videos) ? result.videos : [];
-  return videos
-    .filter((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200)
-    .slice(0, 8);
+  const selected = videos.find((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200);
+  return selected || null;
 }
 
 function formatSongCard(video, requestedBy) {
@@ -822,10 +821,6 @@ function isFormatUnavailableError(error) {
   return text.includes("requested format is not available") || text.includes("no video formats found");
 }
 
-function isSkippableSongSourceError(error) {
-  return isBotCheckError(error) || isFormatUnavailableError(error);
-}
-
 async function downloadWithYtDlp(videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
@@ -887,71 +882,76 @@ async function resolveYtDlpCookiesPath() {
 async function handleSongCommand(client, message, args) {
   const query = args.join(" ").trim();
   if (!query) {
-    await message.reply(`Use: ${COMMAND_PREFIX}song <song name>`);
+    await message.reply(`Use: ${COMMAND_PREFIX}song <song name or youtube url>`);
     return;
   }
-
-  await message.reply(`Searching for: "${query}"...`);
   const requestedBy = await formatUser(client, getSenderId(message));
 
   try {
-    const videos = await searchYouTubeSong(query);
-    if (!videos.length) {
-      await message.reply("No YouTube result found for that query.");
-      return;
+    let video = null;
+    let videoUrl = query;
+
+    if (ytdl.validateURL(query)) {
+      try {
+        const info = await ytdl.getBasicInfo(query);
+        video = {
+          title: info?.videoDetails?.title || "Unknown title",
+          author: { name: info?.videoDetails?.author?.name || "Unknown artist" },
+          timestamp: "Unknown duration",
+          url: query,
+          videoId: info?.videoDetails?.videoId || "",
+        };
+      } catch {
+        video = {
+          title: "Unknown title",
+          author: { name: "Unknown artist" },
+          timestamp: "Unknown duration",
+          url: query,
+          videoId: "",
+        };
+      }
+    } else {
+      await message.reply(`Searching for: "${query}"...`);
+      video = await searchYouTubeSong(query);
+      if (!video) {
+        await message.reply("No YouTube result found for that query.");
+        return;
+      }
+      videoUrl = video.url;
     }
 
     const tmpDir = path.join(DATA_DIR, "tmp-audio");
     await fs.mkdir(tmpDir, { recursive: true });
-    let delivered = false;
-    let lastError = null;
 
-    for (const video of videos) {
-      const outputFile = path.join(
-        tmpDir,
-        `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
-      );
-
+    const outputFile = path.join(
+      tmpDir,
+      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
+    );
+    await message.reply(formatSongCard(video, requestedBy));
+    try {
+      await downloadYoutubeAudioAsMp3(videoUrl, outputFile);
+    } catch (primaryError) {
       try {
-        await message.reply(formatSongCard(video, requestedBy));
-        try {
-          await downloadYoutubeAudioAsMp3(video.url, outputFile);
-        } catch (primaryError) {
-          try {
-            await downloadWithYtDlp(video.url, outputFile);
-          } catch (fallbackError) {
-            fallbackError.cause = primaryError;
-            throw fallbackError;
-          }
-        }
-
-        const media = MessageMedia.fromFilePath(outputFile);
-        await client.sendMessage(message.from, media, {
-          sendAudioAsVoice: false,
-          caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
-        });
-        await fs.unlink(outputFile).catch(() => {});
-        delivered = true;
-        break;
-      } catch (error) {
-        lastError = error;
-        await fs.unlink(outputFile).catch(() => {});
-        if (!isSkippableSongSourceError(error)) {
-          throw error;
-        }
+        await downloadWithYtDlp(videoUrl, outputFile);
+      } catch (fallbackError) {
+        fallbackError.cause = primaryError;
+        throw fallbackError;
       }
     }
 
-    if (!delivered) {
-      throw lastError || new Error("All candidate videos were unavailable for download.");
-    }
+    const media = MessageMedia.fromFilePath(outputFile);
+    await client.sendMessage(message.from, media, {
+      sendAudioAsVoice: false,
+      caption: `${video.title || "Song"}\n${videoUrl || ""}`.trim(),
+    });
+    await fs.unlink(outputFile).catch(() => {});
   } catch (error) {
     if (isBotCheckError(error)) {
       await message.reply(
         "Song request failed because YouTube blocked anonymous download. Configure YTDLP_COOKIES_PATH or YTDLP_COOKIES_B64 in Railway and retry.",
       );
     } else if (isFormatUnavailableError(error)) {
-      await message.reply("Song request failed because YouTube did not provide downloadable formats for the matched results. Try a different song name.");
+      await message.reply("Song request failed because this YouTube URL has no downloadable format. Try another song/url.");
     } else {
       await message.reply(`Song request failed: ${getErrorText(error)}`);
     }
