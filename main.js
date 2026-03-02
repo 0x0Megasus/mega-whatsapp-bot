@@ -888,7 +888,15 @@ async function resolveSongInputToUrls(inputValue) {
   if (!raw) return [];
   if (ytdl.validateURL(raw)) return [raw];
 
-  const args = ["--no-warnings", "--no-playlist", "--print", "webpage_url", `ytsearch5:${raw}`];
+  const args = [
+    "--no-warnings",
+    "--no-playlist",
+    "--extractor-args",
+    "youtube:player_client=android,web,ios",
+    "--print",
+    "webpage_url",
+    `ytsearch5:${raw}`,
+  ];
   const cookiePath = await resolveYtDlpCookiePath();
   if (cookiePath) args.push("--cookies", cookiePath);
   return await new Promise((resolve, reject) => {
@@ -949,6 +957,8 @@ async function downloadYouTubeAudioWithYtDlp(url, outputPath) {
       outTemplate,
       "--format",
       format,
+      "--extractor-args",
+      "youtube:player_client=android,web,ios",
     ];
     if (cookiePath) args.push("--cookies", cookiePath);
 
