@@ -54,13 +54,12 @@ def main():
     outtmpl = str(base) + ".%(ext)s"
 
     ffmpeg_path = os.getenv("FFMPEG_BINARY_PATH", "")
-    ydl_opts = {
+    base_ydl_opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "outtmpl": outtmpl,
-        "extractor_args": {"youtube": {"player_client": ["android", "web", "ios", "tv_embedded"]}},
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -70,23 +69,39 @@ def main():
         ],
     }
     if ffmpeg_path:
-        ydl_opts["ffmpeg_location"] = ffmpeg_path
+        base_ydl_opts["ffmpeg_location"] = ffmpeg_path
     cookie_file, temp_cookie_file = resolve_cookie_file()
     if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
+        base_ydl_opts["cookiefile"] = cookie_file
 
     target = args.input.strip()
     is_direct_url = target.startswith("http://") or target.startswith("https://")
     if not is_direct_url:
         target = f"ytsearch5:{target}"
 
+    client_variants = [None, ["web"], ["android"], ["ios"]]
+
+    def extract_with_client_fallback(url, download):
+        last_error = None
+        for clients in client_variants:
+            opts = dict(base_ydl_opts)
+            if clients:
+                opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            ydl = yt_dlp.YoutubeDL(opts)
+            try:
+                return ydl.extract_info(url, download=download)
+            except DownloadError as err:
+                last_error = err
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("yt_dlp extraction failed with no error detail.")
+
     info = None
-    ydl = yt_dlp.YoutubeDL(ydl_opts)
     try:
         if is_direct_url:
-            info = ydl.extract_info(target, download=True)
+            info = extract_with_client_fallback(target, True)
         else:
-            search_result = ydl.extract_info(target, download=False)
+            search_result = extract_with_client_fallback(target, False)
             entries = [e for e in (search_result or {}).get("entries", []) if e]
             last_error = None
             for entry in entries:
@@ -94,7 +109,7 @@ def main():
                 if not entry_url:
                     continue
                 try:
-                    info = ydl.extract_info(entry_url, download=True)
+                    info = extract_with_client_fallback(entry_url, True)
                     if info:
                         break
                 except DownloadError as err:
