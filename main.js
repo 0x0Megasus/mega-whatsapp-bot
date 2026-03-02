@@ -21,32 +21,11 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
-const PIPED_API_BASES = (process.env.PIPED_API_BASES || "https://pipedapi.kavin.rocks,https://piped.video/api/v1")
-  .split(",")
-  .map((item) => normalizePipedApiBase(item))
-  .filter(Boolean);
 let ffmpegConfigured = false;
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
-
-function normalizePipedApiBase(raw = "") {
-  const input = String(raw || "").trim();
-  if (!input) return "";
-
-  const fixedProtocol = input.startsWith("https//") ? input.replace(/^https\/\//, "https://") : input;
-  try {
-    const parsed = new URL(fixedProtocol);
-    const pathName = (parsed.pathname || "").replace(/\/+$/, "");
-    if (pathName.endsWith("/api/v1")) {
-      return `${parsed.origin}${pathName}`;
-    }
-    return `${parsed.origin}/api/v1`;
-  } catch {
-    return "";
-  }
-}
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -708,90 +687,6 @@ function flagHelpText() {
   ].join("\n");
 }
 
-function formatDuration(seconds) {
-  const total = Number(seconds || 0);
-  if (!Number.isFinite(total) || total <= 0) return "Unknown duration";
-  const hrs = Math.floor(total / 3600);
-  const mins = Math.floor((total % 3600) / 60);
-  const secs = Math.floor(total % 60);
-  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-  return `${mins}:${String(secs).padStart(2, "0")}`;
-}
-
-function extractYouTubeVideoId(input = "") {
-  const value = String(input || "").trim();
-  if (!value) return null;
-  try {
-    const parsed = new URL(value);
-    const host = parsed.hostname.toLowerCase();
-    if (host.includes("youtu.be")) {
-      const id = parsed.pathname.replace(/^\/+/, "").split("/")[0];
-      return id || null;
-    }
-    if (host.includes("youtube.com")) {
-      const fromQuery = parsed.searchParams.get("v");
-      if (fromQuery) return fromQuery;
-      const parts = parsed.pathname.split("/").filter(Boolean);
-      const idx = parts.findIndex((p) => p === "shorts" || p === "embed" || p === "live");
-      if (idx >= 0 && parts[idx + 1]) return parts[idx + 1];
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function parseVideoIdFromPipedItem(item = {}) {
-  const rawUrl = String(item?.url || "");
-  const watchMatch = rawUrl.match(/[?&]v=([A-Za-z0-9_-]{6,})/);
-  if (watchMatch?.[1]) return watchMatch[1];
-  const shortMatch = rawUrl.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/);
-  if (shortMatch?.[1]) return shortMatch[1];
-  const id = String(item?.id || item?.videoId || "");
-  return id || null;
-}
-
-async function fetchPipedJson(endpointPath) {
-  let lastError = null;
-  for (const base of PIPED_API_BASES) {
-    const url = `${base}${endpointPath}`;
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-      if (!contentType.includes("application/json")) {
-        const bodySnippet = (await response.text()).slice(0, 120).replace(/\s+/g, " ");
-        throw new Error(`Non-JSON response from ${base}: ${bodySnippet}`);
-      }
-      return await response.json();
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError || new Error("All free music API endpoints failed.");
-}
-
-async function searchSongCandidates(query) {
-  const payload = await fetchPipedJson(`/search?q=${encodeURIComponent(query)}&filter=videos`);
-  const items = Array.isArray(payload) ? payload : [];
-  return items
-    .map((item) => {
-      const videoId = parseVideoIdFromPipedItem(item);
-      if (!videoId) return null;
-      const durationSeconds = Number(item?.duration || item?.lengthSeconds || 0);
-      if (durationSeconds > 0 && durationSeconds > 1200) return null;
-      return {
-        videoId,
-        title: item?.title || "Unknown title",
-        author: { name: item?.uploaderName || item?.uploader || "Unknown artist" },
-        timestamp: formatDuration(durationSeconds),
-        url: `https://youtube.com/watch?v=${videoId}`,
-      };
-    })
-    .filter(Boolean)
-    .slice(0, 6);
-}
-
 function formatSongCard(video, requestedBy) {
   const title = video?.title || "Unknown title";
   const author = video?.author?.name || "Unknown artist";
@@ -824,8 +719,7 @@ async function downloadSongWithPython(videoUrl, outputFile) {
   let lastError = null;
   for (const pythonBin of pythonCandidates) {
     try {
-      await runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile);
-      return;
+      return await runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile);
     } catch (error) {
       lastError = error;
     }
@@ -859,7 +753,20 @@ async function runPythonDownload(pythonBin, scriptPath, videoUrl, outputFile) {
     });
     proc.on("close", (code) => {
       if (code === 0 && fsSync.existsSync(outputFile)) {
-        resolve();
+        const line = stdout
+          .trim()
+          .split(/\r?\n/)
+          .reverse()
+          .find(Boolean);
+        if (!line) {
+          resolve({ output: outputFile, title: "", uploader: "", webpage_url: "", duration: 0 });
+          return;
+        }
+        try {
+          resolve(JSON.parse(line));
+        } catch {
+          resolve({ output: outputFile, title: "", uploader: "", webpage_url: "", duration: 0 });
+        }
         return;
       }
       const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
@@ -877,59 +784,31 @@ async function handleSongCommand(client, message, args) {
   const requestedBy = await formatUser(client, getSenderId(message));
 
   try {
-    let candidates = [];
-    const directVideoId = extractYouTubeVideoId(query);
-    if (directVideoId) {
-      candidates = [
-        {
-          title: "Unknown title",
-          author: { name: "Unknown artist" },
-          timestamp: "Unknown duration",
-          url: `https://youtube.com/watch?v=${directVideoId}`,
-          videoId: directVideoId,
-        },
-      ];
-    } else {
-      await message.reply(`Searching for: "${query}"...`);
-      candidates = await searchSongCandidates(query);
-      if (!candidates.length) {
-        await message.reply("No YouTube result found for that query.");
-        return;
-      }
-    }
-
     const tmpDir = path.join(DATA_DIR, "tmp-audio");
     await fs.mkdir(tmpDir, { recursive: true });
-    let sent = false;
-    let lastError = null;
-    for (const video of candidates) {
-      const outputFile = path.join(
-        tmpDir,
-        `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
-      );
-      try {
-        await message.reply(formatSongCard(video, requestedBy));
-        await downloadSongWithPython(video.url, outputFile);
-        const media = MessageMedia.fromFilePath(outputFile);
-        await client.sendMessage(message.from, media, {
-          sendAudioAsVoice: false,
-          caption: `${video.title || "Song"}\n${video.url || ""}`.trim(),
-        });
-        await fs.unlink(outputFile).catch(() => {});
-        sent = true;
-        break;
-      } catch (error) {
-        lastError = error;
-        await fs.unlink(outputFile).catch(() => {});
-        if (directVideoId) {
-          throw error;
-        }
-      }
-    }
+    const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
 
-    if (!sent) {
-      throw lastError || new Error("Could not download any matched result.");
-    }
+    const seedVideo = {
+      title: query,
+      author: { name: "Unknown artist" },
+      timestamp: "Unknown duration",
+      url: query,
+    };
+    await message.reply(formatSongCard(seedVideo, requestedBy));
+
+    const meta = await downloadSongWithPython(query, outputFile);
+    const finalVideo = {
+      title: meta?.title || query,
+      author: { name: meta?.uploader || "Unknown artist" },
+      timestamp: "Unknown duration",
+      url: meta?.webpage_url || query,
+    };
+    const media = MessageMedia.fromFilePath(outputFile);
+    await client.sendMessage(message.from, media, {
+      sendAudioAsVoice: false,
+      caption: `${finalVideo.title || "Song"}\n${finalVideo.url || ""}`.trim(),
+    });
+    await fs.unlink(outputFile).catch(() => {});
   } catch (error) {
     const errText = getErrorText(error);
     const lower = errText.toLowerCase();

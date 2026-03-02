@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Simple YouTube audio downloader for bot integration.
-Requires: pip install yt-dlp
+Requires: yt-dlp (apt package or pip install yt-dlp)
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -12,8 +13,8 @@ import yt_dlp
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Download a YouTube URL as MP3")
-    parser.add_argument("--url", required=True, help="YouTube video URL")
+    parser = argparse.ArgumentParser(description="Download a song query or YouTube URL as MP3")
+    parser.add_argument("--input", required=True, help="Song name query or YouTube URL")
     parser.add_argument("--output", required=True, help="Absolute output .mp3 file path")
     return parser.parse_args()
 
@@ -52,8 +53,18 @@ def main():
     if ffmpeg_path:
         ydl_opts["ffmpeg_location"] = ffmpeg_path
 
+    target = args.input.strip()
+    if not target.startswith("http://") and not target.startswith("https://"):
+        target = f"ytsearch1:{target}"
+
+    info = None
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([args.url])
+        info = ydl.extract_info(target, download=True)
+
+    if isinstance(info, dict) and isinstance(info.get("entries"), list):
+        entries = [e for e in info.get("entries") if e]
+        if entries:
+            info = entries[0]
 
     downloaded = find_downloaded_file(base)
     if downloaded is None:
@@ -64,7 +75,14 @@ def main():
             output_path.unlink()
         downloaded.replace(output_path)
 
-    print(str(output_path))
+    payload = {
+        "output": str(output_path),
+        "title": (info or {}).get("title", ""),
+        "uploader": (info or {}).get("uploader", ""),
+        "webpage_url": (info or {}).get("webpage_url", ""),
+        "duration": int((info or {}).get("duration") or 0),
+    }
+    print(json.dumps(payload, ensure_ascii=True))
 
 
 if __name__ == "__main__":
