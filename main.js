@@ -6,7 +6,7 @@ const { spawn } = require("child_process");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
-const ytdl = require("ytdl-core");
+const ytdl = require("@distube/ytdl-core");
 const ytSearch = require("yt-search");
 
 let WWebJSUtil = null;
@@ -721,11 +721,32 @@ function getFfmpegExecutable() {
 
 async function downloadYoutubeAudioAsMp3(videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
-  const audioStream = ytdl(videoUrl, {
-    filter: "audioonly",
-    quality: "highestaudio",
-    highWaterMark: 1 << 25,
-  });
+  const createAudioStream = async () => {
+    try {
+      return ytdl(videoUrl, {
+        filter: "audioonly",
+        quality: "highestaudio",
+        highWaterMark: 1 << 25,
+        dlChunkSize: 0,
+      });
+    } catch {
+      const info = await ytdl.getInfo(videoUrl);
+      const format = ytdl.chooseFormat(info.formats, {
+        quality: "highestaudio",
+        filter: "audioonly",
+      });
+      if (!format?.url) {
+        throw new Error("No audio format available for this video.");
+      }
+      return ytdl.downloadFromInfo(info, {
+        format,
+        highWaterMark: 1 << 25,
+        dlChunkSize: 0,
+      });
+    }
+  };
+
+  const audioStream = await createAudioStream();
 
   await new Promise((resolve, reject) => {
     let stderr = "";
@@ -965,22 +986,22 @@ async function handleFlagCommand(client, message, args) {
 
 function getHelpText() {
   return [
-    "╔════════ WHATSAPP MEGA BOT ════════╗",
-    "Core Commands",
+    "*WHATSAPP MEGA BOT*",
+    "",
+    "Core Commands:",
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}song <name>`,
     `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
     "",
-    "Games",
+    "Games:",
     `${COMMAND_PREFIX}mafia help`,
     `${COMMAND_PREFIX}flag help`,
     "",
-    "Owner Commands",
+    "Owner Commands:",
     `${COMMAND_PREFIX}kick @user (group only)`,
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
     `${COMMAND_PREFIX}resetstore`,
-    "╚════════════════════════════════════╝",
   ].join("\n");
 }
 

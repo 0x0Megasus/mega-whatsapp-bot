@@ -12,10 +12,10 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "qrcode-terminal": "^0.12.0",
     "whatsapp-web.js": "^1.26.0",
-    "yt-search": "^2.13.1",
-    "ytdl-core": "^4.11.5"
+    "yt-search": "^2.13.1"
   }
 }
