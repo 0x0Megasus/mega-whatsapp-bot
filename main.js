@@ -2,6 +2,7 @@ const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const puppeteer = require("puppeteer");
 const qrcode = require("qrcode-terminal");
 const http = require("http");
+const { spawn } = require("child_process");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
@@ -863,14 +864,109 @@ function downloadYouTubeAudio(url, outputPath) {
   });
 }
 
+async function resolveSongInputToUrl(inputValue) {
+  const raw = String(inputValue || "").trim();
+  if (!raw) return null;
+  if (ytdl.validateURL(raw)) return raw;
+
+  const args = ["--no-warnings", "--no-playlist", "--print", "webpage_url", `ytsearch1:${raw}`];
+  return await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } });
+
+    proc.on("error", (error) => reject(error));
+    proc.stdout.on("data", (chunk) => {
+      stdout += String(chunk || "");
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `yt-dlp search failed with exit code ${code}`));
+        return;
+      }
+      const url = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /^https?:\/\//i.test(line));
+      resolve(url || null);
+    });
+  });
+}
+
+function isYtdlBlockedError(error) {
+  const text = getErrorText(error).toLowerCase();
+  return text.includes("status code: 410") || text.includes("sign in to confirm you") || text.includes("minigeterror");
+}
+
+async function downloadYouTubeAudioWithYtDlp(url, outputPath) {
+  const ffmpegPath = getFfmpegExecutable();
+  const outTemplate = outputPath.replace(/\.mp3$/i, ".%(ext)s");
+  const args = [
+    url,
+    "--extract-audio",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "0",
+    "--no-playlist",
+    "--no-warnings",
+    "--ffmpeg-location",
+    ffmpegPath,
+    "--output",
+    outTemplate,
+    "--format",
+    "bestaudio/best",
+  ];
+
+  await new Promise((resolve, reject) => {
+    let stderr = "";
+    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env } });
+
+    proc.on("error", (error) => reject(error));
+    proc.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `yt-dlp failed with exit code ${code}`));
+        return;
+      }
+      resolve();
+    });
+  });
+
+  const dir = path.dirname(outputPath);
+  const baseName = path.basename(outputPath, ".mp3");
+  const files = await fs.readdir(dir);
+  const candidates = files
+    .filter((name) => name.startsWith(`${baseName}.`))
+    .filter((name) => !name.endsWith(".part"))
+    .map((name) => path.join(dir, name));
+
+  if (!candidates.length) {
+    throw new Error("yt-dlp completed but output file was not created.");
+  }
+
+  const mp3 = candidates.find((item) => item.toLowerCase().endsWith(".mp3")) || candidates[0];
+  if (mp3 !== outputPath) {
+    if (fsSync.existsSync(outputPath)) await fs.unlink(outputPath).catch(() => {});
+    await fs.rename(mp3, outputPath);
+  }
+}
+
 async function handleSongCommand(client, message, args) {
-  const url = args.join(" ").trim();
-  if (!url) {
-    await message.reply(`Use: ${COMMAND_PREFIX}song <youtube-url>`);
+  const input = args.join(" ").trim();
+  if (!input) {
+    await message.reply(`Use: ${COMMAND_PREFIX}song <song name or youtube-url>`);
     return;
   }
-  if (!ytdl.validateURL(url)) {
-    await message.reply(`Please send a valid YouTube URL.\nUse: ${COMMAND_PREFIX}song <youtube-url>`);
+
+  const url = await resolveSongInputToUrl(input);
+  if (!url) {
+    await message.reply("No result found for that song.");
     return;
   }
 
@@ -883,7 +979,13 @@ async function handleSongCommand(client, message, args) {
     const title = info?.videoDetails?.title || "YouTube audio";
     await message.reply(`Downloading: ${title}`);
 
-    await downloadYouTubeAudio(url, outputFile);
+    try {
+      await downloadYouTubeAudio(url, outputFile);
+    } catch (error) {
+      if (!isYtdlBlockedError(error)) throw error;
+      await message.reply("Primary downloader blocked by YouTube. Retrying with fallback...");
+      await downloadYouTubeAudioWithYtDlp(url, outputFile);
+    }
     const media = MessageMedia.fromFilePath(outputFile);
     await client.sendMessage(message.from, media, {
       sendAudioAsVoice: false,
@@ -903,7 +1005,7 @@ function getHelpText() {
     "",
     "Core Commands:",
     `${COMMAND_PREFIX}help`,
-    `${COMMAND_PREFIX}song <youtube-url>`,
+    `${COMMAND_PREFIX}song <song name or youtube-url>`,
     `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
     "",
     "Games:",
