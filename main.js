@@ -696,8 +696,9 @@ function flagHelpText() {
 async function searchYouTubeSong(query) {
   const result = await ytSearch(query);
   const videos = Array.isArray(result?.videos) ? result.videos : [];
-  const selected = videos.find((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200);
-  return selected || null;
+  return videos
+    .filter((video) => Number(video?.seconds || 0) > 0 && Number(video.seconds) <= 1200)
+    .slice(0, 6);
 }
 
 function formatSongCard(video, requestedBy) {
@@ -819,6 +820,10 @@ function isFormatUnavailableError(error) {
     .replace(/\s+/g, " ")
     .trim();
   return text.includes("requested format is not available") || text.includes("no video formats found");
+}
+
+function isSkippableSongError(error) {
+  return isFormatUnavailableError(error) || isBotCheckError(error);
 }
 
 async function downloadWithYtDlp(videoUrl, outputFile) {
@@ -1031,54 +1036,72 @@ async function handleSongCommand(client, message, args) {
   const requestedBy = await formatUser(client, getSenderId(message));
 
   try {
-    let video = null;
-    let videoUrl = query;
-
+    const tmpDir = path.join(DATA_DIR, "tmp-audio");
+    await fs.mkdir(tmpDir, { recursive: true });
+    let candidates = [];
     if (ytdl.validateURL(query)) {
       try {
         const info = await ytdl.getBasicInfo(query);
-        video = {
-          title: info?.videoDetails?.title || "Unknown title",
-          author: { name: info?.videoDetails?.author?.name || "Unknown artist" },
-          timestamp: "Unknown duration",
-          url: query,
-          videoId: info?.videoDetails?.videoId || "",
-        };
+        candidates = [
+          {
+            title: info?.videoDetails?.title || "Unknown title",
+            author: { name: info?.videoDetails?.author?.name || "Unknown artist" },
+            timestamp: "Unknown duration",
+            url: query,
+            videoId: info?.videoDetails?.videoId || "",
+          },
+        ];
       } catch {
-        video = {
-          title: "Unknown title",
-          author: { name: "Unknown artist" },
-          timestamp: "Unknown duration",
-          url: query,
-          videoId: "",
-        };
+        candidates = [
+          {
+            title: "Unknown title",
+            author: { name: "Unknown artist" },
+            timestamp: "Unknown duration",
+            url: query,
+            videoId: "",
+          },
+        ];
       }
     } else {
       await message.reply(`Searching for: "${query}"...`);
-      video = await searchYouTubeSong(query);
-      if (!video) {
+      candidates = await searchYouTubeSong(query);
+      if (!candidates.length) {
         await message.reply("No YouTube result found for that query.");
         return;
       }
-      videoUrl = video.url;
     }
 
-    const tmpDir = path.join(DATA_DIR, "tmp-audio");
-    await fs.mkdir(tmpDir, { recursive: true });
+    let sent = false;
+    let lastError = null;
+    for (const video of candidates) {
+      const outputFile = path.join(
+        tmpDir,
+        `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
+      );
+      const videoUrl = video.url || query;
+      try {
+        await message.reply(formatSongCard(video, requestedBy));
+        await downloadWithYtDlp(videoUrl, outputFile);
+        const media = MessageMedia.fromFilePath(outputFile);
+        await client.sendMessage(message.from, media, {
+          sendAudioAsVoice: false,
+          caption: `${video.title || "Song"}\n${videoUrl}`.trim(),
+        });
+        await fs.unlink(outputFile).catch(() => {});
+        sent = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        await fs.unlink(outputFile).catch(() => {});
+        if (!isSkippableSongError(error) || ytdl.validateURL(query)) {
+          throw error;
+        }
+      }
+    }
 
-    const outputFile = path.join(
-      tmpDir,
-      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
-    );
-    await message.reply(formatSongCard(video, requestedBy));
-    await downloadWithYtDlp(videoUrl, outputFile);
-
-    const media = MessageMedia.fromFilePath(outputFile);
-    await client.sendMessage(message.from, media, {
-      sendAudioAsVoice: false,
-      caption: `${video.title || "Song"}\n${videoUrl || ""}`.trim(),
-    });
-    await fs.unlink(outputFile).catch(() => {});
+    if (!sent) {
+      throw lastError || new Error("Could not download any matched result.");
+    }
   } catch (error) {
     if (isBotCheckError(error)) {
       await message.reply(
