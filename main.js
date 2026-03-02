@@ -838,7 +838,7 @@ async function downloadWithYtDlp(videoUrl, outputFile) {
   }
 
   const attempts = [
-    { ...baseOptions, format: "bestaudio/best" },
+    { ...baseOptions, format: "bestaudio[ext=m4a]/bestaudio/best" },
     { ...baseOptions, format: "best" },
     { ...baseOptions },
   ];
@@ -857,7 +857,86 @@ async function downloadWithYtDlp(videoUrl, outputFile) {
     }
   }
 
+  if (lastError && isFormatUnavailableError(lastError)) {
+    await downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions);
+    return;
+  }
+
   throw lastError || new Error("yt-dlp failed to download this video.");
+}
+
+async function downloadRawYtDlpAndConvert(videoUrl, outputFile, baseOptions = {}) {
+  const rawOutputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
+  const rawOptions = {
+    output: rawOutputTemplate,
+    noWarnings: true,
+    ffmpegLocation: baseOptions.ffmpegLocation || getFfmpegExecutable(),
+    format: "bestaudio/best",
+    noPlaylist: true,
+    geoBypass: true,
+  };
+  if (baseOptions.cookies) {
+    rawOptions.cookies = baseOptions.cookies;
+  }
+
+  await youtubedl(videoUrl, rawOptions);
+
+  const dir = path.dirname(outputFile);
+  const baseName = path.basename(outputFile, ".mp3");
+  const files = await fs.readdir(dir);
+  const candidates = files
+    .filter((name) => name.startsWith(`${baseName}.`))
+    .filter((name) => !name.endsWith(".part"))
+    .map((name) => path.join(dir, name));
+
+  if (!candidates.length) {
+    throw new Error("yt-dlp did not produce an audio file.");
+  }
+
+  const sourcePath = candidates.sort((a, b) => b.length - a.length)[0];
+  if (sourcePath.toLowerCase().endsWith(".mp3")) {
+    if (sourcePath !== outputFile) {
+      await fs.rename(sourcePath, outputFile);
+    }
+    return;
+  }
+
+  await transcodeAudioFileToMp3(sourcePath, outputFile);
+  await fs.unlink(sourcePath).catch(() => {});
+}
+
+async function transcodeAudioFileToMp3(sourcePath, outputFile) {
+  const ffmpegPath = getFfmpegExecutable();
+  await new Promise((resolve, reject) => {
+    let stderr = "";
+    const ffmpeg = spawn(
+      ffmpegPath,
+      [
+        "-y",
+        "-i",
+        sourcePath,
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        outputFile,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+
+    ffmpeg.on("error", (error) => reject(error));
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += String(chunk || "");
+    });
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+    });
+  });
 }
 
 async function resolveYtDlpCookiesPath() {
