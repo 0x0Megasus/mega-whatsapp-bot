@@ -815,20 +815,40 @@ function isBotCheckError(error) {
 async function downloadWithYtDlp(videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
-  const options = {
+  const baseOptions = {
     extractAudio: true,
     audioFormat: "mp3",
     audioQuality: "0",
     output: outputTemplate,
     noWarnings: true,
-    preferFreeFormats: true,
     ffmpegLocation: ffmpegPath,
   };
   const cookieFile = await resolveYtDlpCookiesPath();
   if (cookieFile) {
-    options.cookies = cookieFile;
+    baseOptions.cookies = cookieFile;
   }
-  await youtubedl(videoUrl, options);
+
+  const attempts = [
+    { ...baseOptions, format: "bestaudio/best" },
+    { ...baseOptions, format: "best" },
+    { ...baseOptions },
+  ];
+
+  let lastError = null;
+  for (const options of attempts) {
+    try {
+      await youtubedl(videoUrl, options);
+      return;
+    } catch (error) {
+      lastError = error;
+      const message = getErrorText(error).toLowerCase();
+      const isFormatError =
+        message.includes("requested format is not available") || message.includes("no video formats found");
+      if (!isFormatError) throw error;
+    }
+  }
+
+  throw lastError || new Error("yt-dlp failed to download this video.");
 }
 
 async function resolveYtDlpCookiesPath() {
