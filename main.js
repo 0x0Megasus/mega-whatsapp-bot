@@ -883,12 +883,12 @@ async function resolveYtDlpCookiePath() {
   }
 }
 
-async function resolveSongInputToUrl(inputValue) {
+async function resolveSongInputToUrls(inputValue) {
   const raw = String(inputValue || "").trim();
-  if (!raw) return null;
-  if (ytdl.validateURL(raw)) return raw;
+  if (!raw) return [];
+  if (ytdl.validateURL(raw)) return [raw];
 
-  const args = ["--no-warnings", "--no-playlist", "--print", "webpage_url", `ytsearch1:${raw}`];
+  const args = ["--no-warnings", "--no-playlist", "--print", "webpage_url", `ytsearch5:${raw}`];
   const cookiePath = await resolveYtDlpCookiePath();
   if (cookiePath) args.push("--cookies", cookiePath);
   return await new Promise((resolve, reject) => {
@@ -908,11 +908,11 @@ async function resolveSongInputToUrl(inputValue) {
         reject(new Error(stderr.trim() || `yt-dlp search failed with exit code ${code}`));
         return;
       }
-      const url = stdout
+      const urls = stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
-        .find((line) => /^https?:\/\//i.test(line));
-      resolve(url || null);
+        .filter((line) => /^https?:\/\//i.test(line));
+      resolve([...new Set(urls)]);
     });
   });
 }
@@ -922,44 +922,61 @@ function isYtdlBlockedError(error) {
   return text.includes("status code: 410") || text.includes("sign in to confirm you") || text.includes("minigeterror");
 }
 
+function isYtDlpFormatUnavailable(error) {
+  const text = getErrorText(error).toLowerCase();
+  return text.includes("requested format is not available") || text.includes("no video formats found");
+}
+
 async function downloadYouTubeAudioWithYtDlp(url, outputPath) {
   const ffmpegPath = getFfmpegExecutable();
   const outTemplate = outputPath.replace(/\.mp3$/i, ".%(ext)s");
-  const args = [
-    url,
-    "--extract-audio",
-    "--audio-format",
-    "mp3",
-    "--audio-quality",
-    "0",
-    "--no-playlist",
-    "--no-warnings",
-    "--ffmpeg-location",
-    ffmpegPath,
-    "--output",
-    outTemplate,
-    "--format",
-    "bestaudio/best",
-  ];
   const cookiePath = await resolveYtDlpCookiePath();
-  if (cookiePath) args.push("--cookies", cookiePath);
+  const formats = ["bestaudio[ext=m4a]/bestaudio/best", "bestaudio/best", "best"];
+  let lastError = null;
+  for (const format of formats) {
+    const args = [
+      url,
+      "--extract-audio",
+      "--audio-format",
+      "mp3",
+      "--audio-quality",
+      "0",
+      "--no-playlist",
+      "--no-warnings",
+      "--ffmpeg-location",
+      ffmpegPath,
+      "--output",
+      outTemplate,
+      "--format",
+      format,
+    ];
+    if (cookiePath) args.push("--cookies", cookiePath);
 
-  await new Promise((resolve, reject) => {
-    let stderr = "";
-    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env } });
+    try {
+      await new Promise((resolve, reject) => {
+        let stderr = "";
+        const proc = spawn("yt-dlp", args, { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env } });
 
-    proc.on("error", (error) => reject(error));
-    proc.stderr.on("data", (chunk) => {
-      stderr += String(chunk || "");
-    });
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || `yt-dlp failed with exit code ${code}`));
-        return;
-      }
-      resolve();
-    });
-  });
+        proc.on("error", (error) => reject(error));
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk || "");
+        });
+        proc.on("close", (code) => {
+          if (code !== 0) {
+            reject(new Error(stderr.trim() || `yt-dlp failed with exit code ${code}`));
+            return;
+          }
+          resolve();
+        });
+      });
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (!isYtDlpFormatUnavailable(error)) throw error;
+    }
+  }
+  if (lastError) throw lastError;
 
   const dir = path.dirname(outputPath);
   const baseName = path.basename(outputPath, ".mp3");
@@ -986,39 +1003,57 @@ async function handleSongCommand(client, message, args) {
     await message.reply(`Use: ${COMMAND_PREFIX}song <song name or youtube-url>`);
     return;
   }
+  const isDirectUrl = ytdl.validateURL(input);
 
-  const url = await resolveSongInputToUrl(input);
-  if (!url) {
+  const candidateUrls = await resolveSongInputToUrls(input);
+  if (!candidateUrls.length) {
     await message.reply("No result found for that song.");
     return;
   }
-
   const tmpDir = path.join(DATA_DIR, "tmp-audio");
   await fs.mkdir(tmpDir, { recursive: true });
-  const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
 
   try {
-    const info = await ytdl.getBasicInfo(url).catch(() => null);
-    const title = info?.videoDetails?.title || "YouTube audio";
-    await message.reply(`Downloading: ${title}`);
+    let sent = false;
+    let lastError = null;
 
-    try {
-      await downloadYouTubeAudio(url, outputFile);
-    } catch (error) {
-      if (!isYtdlBlockedError(error)) throw error;
-      await message.reply("Primary downloader blocked by YouTube. Retrying with fallback...");
-      await downloadYouTubeAudioWithYtDlp(url, outputFile);
+    for (const url of candidateUrls) {
+      const outputFile = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.mp3`);
+      const info = await ytdl.getBasicInfo(url).catch(() => null);
+      const title = info?.videoDetails?.title || "YouTube audio";
+      await message.reply(`Downloading: ${title}`);
+
+      try {
+        try {
+          await downloadYouTubeAudio(url, outputFile);
+        } catch (error) {
+          if (!isYtdlBlockedError(error)) throw error;
+          await message.reply("Primary downloader blocked by YouTube. Retrying with fallback...");
+          await downloadYouTubeAudioWithYtDlp(url, outputFile);
+        }
+        const media = MessageMedia.fromFilePath(outputFile);
+        await client.sendMessage(message.from, media, {
+          sendAudioAsVoice: false,
+          caption: `${title}\n${url}`,
+        });
+        await fs.unlink(outputFile).catch(() => {});
+        sent = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        await fs.unlink(outputFile).catch(() => {});
+        if (isDirectUrl || !isYtDlpFormatUnavailable(error)) {
+          throw error;
+        }
+      }
     }
-    const media = MessageMedia.fromFilePath(outputFile);
-    await client.sendMessage(message.from, media, {
-      sendAudioAsVoice: false,
-      caption: `${title}\n${url}`,
-    });
+
+    if (!sent && lastError) {
+      throw lastError;
+    }
   } catch (error) {
     await message.reply(`Song request failed: ${getErrorText(error)}`);
     console.error("Song command error:", error);
-  } finally {
-    await fs.unlink(outputFile).catch(() => {});
   }
 }
 
