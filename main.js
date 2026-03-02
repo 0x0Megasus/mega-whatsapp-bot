@@ -812,6 +812,20 @@ function isBotCheckError(error) {
   );
 }
 
+function isFormatUnavailableError(error) {
+  const text = getErrorText(error)
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[’']/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.includes("requested format is not available") || text.includes("no video formats found");
+}
+
+function isSkippableSongSourceError(error) {
+  return isBotCheckError(error) || isFormatUnavailableError(error);
+}
+
 async function downloadWithYtDlp(videoUrl, outputFile) {
   const ffmpegPath = getFfmpegExecutable();
   const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
@@ -902,9 +916,13 @@ async function handleSongCommand(client, message, args) {
         await message.reply(formatSongCard(video, requestedBy));
         try {
           await downloadYoutubeAudioAsMp3(video.url, outputFile);
-        } catch (error) {
-          if (!isBotCheckError(error)) throw error;
-          await downloadWithYtDlp(video.url, outputFile);
+        } catch (primaryError) {
+          try {
+            await downloadWithYtDlp(video.url, outputFile);
+          } catch (fallbackError) {
+            fallbackError.cause = primaryError;
+            throw fallbackError;
+          }
         }
 
         const media = MessageMedia.fromFilePath(outputFile);
@@ -918,20 +936,22 @@ async function handleSongCommand(client, message, args) {
       } catch (error) {
         lastError = error;
         await fs.unlink(outputFile).catch(() => {});
-        if (!isBotCheckError(error)) {
+        if (!isSkippableSongSourceError(error)) {
           throw error;
         }
       }
     }
 
     if (!delivered) {
-      throw lastError || new Error("All candidate videos were blocked by YouTube.");
+      throw lastError || new Error("All candidate videos were unavailable for download.");
     }
   } catch (error) {
     if (isBotCheckError(error)) {
       await message.reply(
         "Song request failed because YouTube blocked anonymous download. Configure YTDLP_COOKIES_PATH or YTDLP_COOKIES_B64 in Railway and retry.",
       );
+    } else if (isFormatUnavailableError(error)) {
+      await message.reply("Song request failed because YouTube did not provide downloadable formats for the matched results. Try a different song name.");
     } else {
       await message.reply(`Song request failed: ${getErrorText(error)}`);
     }
