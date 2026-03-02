@@ -14,7 +14,7 @@ try {
 }
 
 const ENV_TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
-const MAX_TARGET_GROUPS = 2;
+const MAX_TARGET_GROUPS = 4;
 const COMMAND_PREFIX = process.env.COMMAND_PREFIX || ".";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
@@ -851,7 +851,7 @@ function getHelpText() {
     `${COMMAND_PREFIX}close (owner only, group only)`,
     `${COMMAND_PREFIX}open (owner only, group only)`,
     `${COMMAND_PREFIX}resetstore (admin only)`,
-    `${COMMAND_PREFIX}sticker (admin DM only, send with image/video)`,
+    `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
   ].join("\n");
 }
 
