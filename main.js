@@ -8,6 +8,7 @@ const fsSync = require("fs");
 const path = require("path");
 const ytdl = require("@distube/ytdl-core");
 const ytSearch = require("yt-search");
+const youtubedl = require("youtube-dl-exec");
 
 let WWebJSUtil = null;
 try {
@@ -702,14 +703,13 @@ function formatSongCard(video, requestedBy) {
   const duration = video?.timestamp || "Unknown duration";
   const sourceUrl = video?.url || "Unknown URL";
   return [
-    "╔════════ SONG RESULT ════════╗",
+    "*Song Result*",
     `Title : ${title}`,
     `Artist: ${author}`,
     `Length: ${duration}`,
     `Source: ${sourceUrl}`,
     `Requested by: ${requestedBy}`,
     "Downloading MP3...",
-    "╚═════════════════════════════╝",
   ].join("\n");
 }
 
@@ -791,6 +791,25 @@ async function downloadYoutubeAudioAsMp3(videoUrl, outputFile) {
   });
 }
 
+function isBotCheckError(error) {
+  const text = getErrorText(error).toLowerCase();
+  return text.includes("sign in to confirm you're not a bot") || text.includes("status code: 410");
+}
+
+async function downloadWithYtDlp(videoUrl, outputFile) {
+  const ffmpegPath = getFfmpegExecutable();
+  const outputTemplate = outputFile.replace(/\.mp3$/i, ".%(ext)s");
+  await youtubedl(videoUrl, {
+    extractAudio: true,
+    audioFormat: "mp3",
+    audioQuality: "0",
+    output: outputTemplate,
+    noWarnings: true,
+    preferFreeFormats: true,
+    ffmpegLocation: ffmpegPath,
+  });
+}
+
 async function handleSongCommand(client, message, args) {
   const query = args.join(" ").trim();
   if (!query) {
@@ -816,7 +835,13 @@ async function handleSongCommand(client, message, args) {
       `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${video.videoId || "track"}.mp3`,
     );
 
-    await downloadYoutubeAudioAsMp3(video.url, outputFile);
+    try {
+      await downloadYoutubeAudioAsMp3(video.url, outputFile);
+    } catch (error) {
+      if (!isBotCheckError(error)) throw error;
+      await message.reply("Primary YouTube stream blocked. Retrying with fallback downloader...");
+      await downloadWithYtDlp(video.url, outputFile);
+    }
     const media = MessageMedia.fromFilePath(outputFile);
     await client.sendMessage(message.from, media, {
       sendAudioAsVoice: false,
