@@ -8,6 +8,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const {
   downloadSongAsMp3,
+  searchYouTubeFirstVideoUrl,
   sanitizeSongTitle,
   cleanupDownloadedFile,
 } = require("./songDownloader");
@@ -1427,17 +1428,29 @@ async function handleCommand(client, message) {
       return;
     }
 
-    const songQuery = parts.join(" ").trim();
+    const wantsUrlDebug = ["url", "--url", "-u"].includes((parts[0] || "").toLowerCase());
+    const songQuery = (wantsUrlDebug ? parts.slice(1) : parts).join(" ").trim();
     if (!songQuery) {
-      await message.reply("Please provide a song name. Example: .song Eminem Lose Yourself");
+      await message.reply("Please provide a song name. Example: .song Eminem Lose Yourself or .song url Eminem Lose Yourself");
       return;
     }
 
     let downloadedPath = null;
+    let debugSourceUrl = null;
     try {
       await message.reply(`Downloading song: ${songQuery}`);
-      const { filePath, videoTitle } = await downloadSongAsMp3(songQuery);
+
+      if (wantsUrlDebug) {
+        const isDirectUrl = /^https?:\/\//i.test(songQuery);
+        debugSourceUrl = isDirectUrl ? songQuery : await searchYouTubeFirstVideoUrl(songQuery);
+        await message.reply(`Source URL: ${debugSourceUrl}`);
+      }
+
+      const { filePath, videoTitle, sourceUrl } = await downloadSongAsMp3(debugSourceUrl || songQuery);
       downloadedPath = filePath;
+      if (!debugSourceUrl && wantsUrlDebug && sourceUrl) {
+        await message.reply(`Source URL: ${sourceUrl}`);
+      }
 
       const media = MessageMedia.fromFilePath(downloadedPath);
       await client.sendMessage(message.from, media, {
@@ -1450,6 +1463,9 @@ async function handleCommand(client, message) {
       console.error("Song command error:", getErrorText(error));
       const friendlyMessage = getErrorText(error) || "Sorry, I couldn't download that song right now.";
       await message.reply(friendlyMessage);
+      if (wantsUrlDebug && debugSourceUrl) {
+        await message.reply(`Tried URL: ${debugSourceUrl}`);
+      }
     } finally {
       await cleanupDownloadedFile(downloadedPath);
     }
