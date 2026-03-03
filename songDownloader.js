@@ -134,53 +134,35 @@ function normalizeYtDlpError(error) {
   return error;
 }
 
-function buildDownloadCommand({ ytdlp, outputTemplate, target, formatSelector = "", extractorArgs = "", fromSearch = false }) {
+function buildSimpleDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector = "" }) {
   const formatPart = formatSelector ? ` --format ${quoteArg(formatSelector)}` : "";
-  const extractorPart = extractorArgs ? ` --extractor-args ${quoteArg(extractorArgs)}` : "";
-  const searchPart = fromSearch
-    ? " --ignore-errors --no-abort-on-error --playlist-end 10 --max-downloads 1"
-    : " --no-playlist";
   return (
-    `${quoteArg(ytdlp)} -x --audio-format mp3 --audio-quality 0 ${searchPart} ` +
-    `${extractorPart}${formatPart} --print title --print after_move:filepath ` +
-    `-o ${quoteArg(outputTemplate)} ${quoteArg(target)}` +
+    `${quoteArg(ytdlp)} -x --audio-format mp3 --audio-quality 0 --no-playlist ` +
+    `${formatPart} --print title --print after_move:filepath ` +
+    `-o ${quoteArg(outputTemplate)} ${quoteArg(targetUrl)}` +
     `${resolveCookieArgs()}${resolveProxyArgs()}`
   );
 }
 
-async function runDownloadWithFallback({ ytdlp, outputTemplate, target, fromSearch = false }) {
+async function runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl }) {
   const commands = [
-    buildDownloadCommand({
+    buildSimpleDownloadCommand({
       ytdlp,
       outputTemplate,
-      target,
+      targetUrl,
       formatSelector: "",
-      extractorArgs: "youtube:player_client=android,web,mweb",
-      fromSearch,
     }),
-    buildDownloadCommand({
+    buildSimpleDownloadCommand({
       ytdlp,
       outputTemplate,
-      target,
-      formatSelector: "bestaudio/best",
-      extractorArgs: "youtube:player_client=android,web,mweb",
-      fromSearch,
+      targetUrl,
+      formatSelector: "bestaudio*/best",
     }),
-    buildDownloadCommand({
+    buildSimpleDownloadCommand({
       ytdlp,
       outputTemplate,
-      target,
-      formatSelector: "",
-      extractorArgs: "",
-      fromSearch,
-    }),
-    buildDownloadCommand({
-      ytdlp,
-      outputTemplate,
-      target,
-      formatSelector: "bestaudio/best",
-      extractorArgs: "",
-      fromSearch,
+      targetUrl,
+      formatSelector: "ba/b",
     }),
   ];
 
@@ -203,23 +185,35 @@ async function downloadSongAsMp3(input) {
     throw new Error("Missing song query.");
   }
 
-  const fromSearch = !isHttpUrl(rawInput);
-  const downloadTarget = fromSearch ? `ytsearch10:${rawInput}` : rawInput;
-
   const ytdlp = resolveYtDlpBinary();
   const outputTemplate = path.join(TEMP_DIR, "%(id)s.%(ext)s");
+  const candidateUrls = isHttpUrl(rawInput)
+    ? [rawInput]
+    : await searchYouTubeCandidateUrls(rawInput, 10);
+  if (!candidateUrls.length) {
+    throw new Error("No YouTube result found for this query.");
+  }
 
   let stdout = "";
-  try {
-    const result = await runDownloadWithFallback({
-      ytdlp,
-      outputTemplate,
-      target: downloadTarget,
-      fromSearch,
-    });
-    stdout = result.stdout;
-  } catch (error) {
-    throw normalizeYtDlpError(error);
+  let selectedUrl = "";
+  let lastError = null;
+  for (const targetUrl of candidateUrls) {
+    try {
+      const result = await runDownloadWithFallback({
+        ytdlp,
+        outputTemplate,
+        targetUrl,
+      });
+      stdout = result.stdout;
+      selectedUrl = targetUrl;
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!stdout) {
+    throw normalizeYtDlpError(lastError || new Error("Failed to download song."));
   }
 
   const lines = stdout
@@ -241,7 +235,7 @@ async function downloadSongAsMp3(input) {
   return {
     filePath: absolutePath,
     videoTitle: titleLine,
-    sourceUrl: fromSearch ? "" : rawInput,
+    sourceUrl: selectedUrl || candidateUrls[0],
   };
 }
 
