@@ -1,4 +1,5 @@
 FROM node:20-bookworm
+ARG YTDLP_VERSION=2026.01.31
 
 WORKDIR /app
 
@@ -8,7 +9,7 @@ RUN apt-get update && apt-get install -y \
   libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 \
   libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 xdg-utils \
   ffmpeg curl python3 \
-  && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+  && curl -L https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp -o /usr/local/bin/yt-dlp \
   && chmod a+rx /usr/local/bin/yt-dlp \
   && rm -rf /var/lib/apt/lists/*
 
