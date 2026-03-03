@@ -70,9 +70,7 @@ async function downloadSongAsMp3(songName) {
   }
 
   const outputTemplate = path.join("temp", "%(id)s.%(ext)s");
-  const args = [
-    "--js-runtimes",
-    "node",
+  const baseArgs = [
     "-x",
     "--audio-format",
     "mp3",
@@ -86,7 +84,21 @@ async function downloadSongAsMp3(songName) {
     `ytsearch1:${query}`,
   ];
 
-  const { stdout } = await runYtDlp(args);
+  let stdout = "";
+  try {
+    // Preferred command for newer yt-dlp builds.
+    const result = await runYtDlp(["--js-runtimes", "node", ...baseArgs]);
+    stdout = result.stdout;
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (!message.includes("no such option: --js-runtimes")) {
+      throw error;
+    }
+    // Fallback for older distro yt-dlp versions (common on containers).
+    const fallback = await runYtDlp(baseArgs);
+    stdout = fallback.stdout;
+  }
+
   const lines = stdout
     .split(/\r?\n/)
     .map((line) => line.trim())

@@ -5,6 +5,7 @@ const http = require("http");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const { downloadSongAsMp3, sanitizeSongTitle, cleanupDownloadedFile } = require("./songDownloader");
 
 let WWebJSUtil = null;
@@ -316,7 +317,21 @@ function configureFfmpegPath() {
     console.log(`FFmpeg configured for sticker conversion: ${candidatePath}`);
     return;
   } catch {
-    // Keep fallback behavior for image stickers.
+    // Fallback to system ffmpeg binary if installer package is unavailable.
+    try {
+      const probe = spawnSync("ffmpeg", ["-version"], { stdio: "ignore", windowsHide: true });
+      if (probe.status === 0) {
+        ffmpegBinaryPath = "ffmpeg";
+        process.env.FFMPEG_PATH = "ffmpeg";
+        if (WWebJSUtil?.setFfmpegPath) {
+          WWebJSUtil.setFfmpegPath("ffmpeg");
+        }
+        console.log("FFmpeg configured for sticker conversion: ffmpeg (system PATH)");
+        return;
+      }
+    } catch {
+      // Continue to warning below.
+    }
   }
   ffmpegBinaryPath = null;
   console.warn("FFmpeg not configured. Video stickers will fail until FFmpeg is installed.");
