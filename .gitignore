@@ -3,3 +3,4 @@ node_modules/
 .wwebjs_cache/
 bot-store.json
 npm-debug.log*
+.env

@@ -6,12 +6,6 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const {
-  downloadSongAsMp3,
-  searchYouTubeFirstVideoUrl,
-  sanitizeSongTitle,
-  cleanupDownloadedFile,
-} = require("./songDownloader");
 
 let WWebJSUtil = null;
 try {
@@ -1419,55 +1413,6 @@ async function handleCommand(client, message) {
     if (totalSources > 1) {
       await message.reply(`Done. Converted ${successCount}/${totalSources} to stickers.`);
       return;
-    }
-    return;
-  }
-
-  if (command === "song") {
-    if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
-      return;
-    }
-
-    const wantsUrlDebug = ["url", "--url", "-u"].includes((parts[0] || "").toLowerCase());
-    const songQuery = (wantsUrlDebug ? parts.slice(1) : parts).join(" ").trim();
-    if (!songQuery) {
-      await message.reply("Please provide a song name. Example: .song Eminem Lose Yourself or .song url Eminem Lose Yourself");
-      return;
-    }
-
-    let downloadedPath = null;
-    let debugSourceUrl = null;
-    try {
-      await message.reply(`Downloading song: ${songQuery}`);
-
-      if (wantsUrlDebug) {
-        const isDirectUrl = /^https?:\/\//i.test(songQuery);
-        debugSourceUrl = isDirectUrl ? songQuery : await searchYouTubeFirstVideoUrl(songQuery);
-        await message.reply(`Source URL: ${debugSourceUrl}`);
-      }
-
-      const { filePath, videoTitle, sourceUrl } = await downloadSongAsMp3(debugSourceUrl || songQuery);
-      downloadedPath = filePath;
-      if (!debugSourceUrl && wantsUrlDebug && sourceUrl) {
-        await message.reply(`Source URL: ${sourceUrl}`);
-      }
-
-      const media = MessageMedia.fromFilePath(downloadedPath);
-      await client.sendMessage(message.from, media, {
-        sendAudioAsVoice: false,
-      });
-
-      const resolvedTitle = sanitizeSongTitle(videoTitle || songQuery);
-      await message.reply(`Done: ${resolvedTitle}`);
-    } catch (error) {
-      console.error("Song command error:", getErrorText(error));
-      const friendlyMessage = getErrorText(error) || "Sorry, I couldn't download that song right now.";
-      await message.reply(friendlyMessage);
-      if (wantsUrlDebug && debugSourceUrl) {
-        await message.reply(`Tried URL: ${debugSourceUrl}`);
-      }
-    } finally {
-      await cleanupDownloadedFile(downloadedPath);
     }
     return;
   }
