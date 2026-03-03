@@ -61,6 +61,42 @@ function runYtDlp(args, timeoutMs = 180000) {
   });
 }
 
+function resolveCookieArgs() {
+  const cookieFile = String(process.env.YTDLP_COOKIE_FILE || "").trim();
+  if (!cookieFile) return [];
+  return ["--cookies", cookieFile];
+}
+
+function resolveProxyArgs() {
+  const proxyUrl = String(process.env.YTDLP_PROXY_URL || "").trim();
+  if (!proxyUrl) return [];
+  return ["--proxy", proxyUrl];
+}
+
+async function searchYouTubeCandidateUrls(songName, limit = 5) {
+  const query = String(songName || "").trim();
+  if (!query) throw new Error("Missing song name.");
+
+  const args = [
+    "--flat-playlist",
+    "--no-warnings",
+    "--no-playlist",
+    "--print",
+    "webpage_url",
+    `ytsearch${Math.max(1, Number(limit) || 5)}:${query}`,
+    ...resolveCookieArgs(),
+    ...resolveProxyArgs(),
+  ];
+
+  const { stdout } = await runYtDlp(args, 90000);
+  const urls = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^https?:\/\//i.test(line));
+
+  return [...new Set(urls)];
+}
+
 async function searchYouTubeFirstVideoUrl(songName) {
   const query = String(songName || "").trim();
   if (!query) throw new Error("Missing song name.");
@@ -89,8 +125,14 @@ async function searchYouTubeFirstVideoUrl(songName) {
 
 function normalizeYtDlpError(error) {
   const raw = String(error?.message || "");
+  if (raw.includes("Requested format is not available") || raw.includes("no video formats found")) {
+    return new Error("YouTube returned results but no downloadable audio format was available.");
+  }
   if (raw.includes("Sign in to confirm you’re not a bot")) {
-    return new Error("YouTube blocked this request. Try another song in a moment.");
+    return new Error("YouTube blocked this request. Configure YTDLP_COOKIE_FILE (and optionally YTDLP_PROXY_URL) then try again.");
+  }
+  if (raw.includes("Failed to start yt-dlp")) {
+    return new Error("yt-dlp is not installed in runtime. Install yt-dlp in your Docker image.");
   }
   return error;
 }
@@ -103,41 +145,74 @@ async function downloadSongAsMp3(songName) {
     throw new Error("Missing song name.");
   }
 
-  const targetUrl = await searchYouTubeFirstVideoUrl(query);
+  let candidateUrls = [];
+  try {
+    candidateUrls = await searchYouTubeCandidateUrls(query, 5);
+  } catch {
+    candidateUrls = [];
+  }
+  if (!candidateUrls.length) {
+    candidateUrls = [await searchYouTubeFirstVideoUrl(query)];
+  }
+
   const outputTemplate = path.join("temp", "%(id)s.%(ext)s");
-  const baseArgs = [
+  const sharedArgs = [
     "-x",
     "--audio-format",
     "mp3",
-    "--extractor-args",
-    "youtube:player_client=android,web",
     "--no-playlist",
+    "--socket-timeout",
+    "30",
+    "--retries",
+    "3",
+    "--force-ipv4",
     "--print",
     "title",
     "--print",
     "after_move:filepath",
     "-o",
     outputTemplate,
-    targetUrl,
+    ...resolveCookieArgs(),
+    ...resolveProxyArgs(),
   ];
 
+  const strategyArgs = [
+    ["--extractor-args", "youtube:player_client=android,web"],
+    ["--extractor-args", "youtube:player_client=ios,android"],
+    ["--extractor-args", "youtube:player_client=web_creator,android"],
+  ];
+
+  const attempts = [];
+  for (const targetUrl of candidateUrls) {
+    for (const strategy of strategyArgs) {
+      attempts.push(["--js-runtimes", "node", ...sharedArgs, ...strategy, targetUrl]);
+      attempts.push([...sharedArgs, ...strategy, targetUrl]);
+    }
+  }
+
   let stdout = "";
-  try {
-    // Preferred command for newer yt-dlp builds.
-    const result = await runYtDlp(["--js-runtimes", "node", ...baseArgs]);
-    stdout = result.stdout;
-  } catch (error) {
-    const message = String(error?.message || "");
-    if (!message.includes("no such option: --js-runtimes")) {
-      throw normalizeYtDlpError(error);
-    }
-    // Fallback for older distro yt-dlp versions (common on containers).
+  let lastError = null;
+  for (const args of attempts) {
     try {
-      const fallback = await runYtDlp(baseArgs);
-      stdout = fallback.stdout;
-    } catch (fallbackError) {
-      throw normalizeYtDlpError(fallbackError);
+      const result = await runYtDlp(args);
+      stdout = result.stdout;
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || "");
+      // Keep trying if this runtime flag is unsupported.
+      if (message.includes("no such option: --js-runtimes")) {
+        continue;
+      }
+      if (message.includes("Requested format is not available")) {
+        continue;
+      }
     }
+  }
+
+  if (!stdout) {
+    throw normalizeYtDlpError(lastError || new Error("Failed to download song."));
   }
 
   const lines = stdout
