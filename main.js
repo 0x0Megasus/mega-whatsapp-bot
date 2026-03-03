@@ -6,7 +6,12 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { downloadSongAsMp3, sanitizeSongTitle, cleanupDownloadedFile } = require("./songDownloader");
+const {
+  downloadSongAsMp3,
+  searchYouTubeFirstVideoUrl,
+  sanitizeSongTitle,
+  cleanupDownloadedFile,
+} = require("./songDownloader");
 
 let WWebJSUtil = null;
 try {
@@ -1432,7 +1437,8 @@ async function handleCommand(client, message) {
     let downloadedPath = null;
     try {
       await message.reply(`Downloading song: ${songQuery}`);
-      const { filePath, videoTitle } = await downloadSongAsMp3(songQuery);
+      const songUrl = await searchYouTubeFirstVideoUrl(songQuery);
+      const { filePath, videoTitle } = await downloadSongAsMp3(songUrl);
       downloadedPath = filePath;
 
       const media = MessageMedia.fromFilePath(downloadedPath);
@@ -1443,8 +1449,9 @@ async function handleCommand(client, message) {
       const resolvedTitle = sanitizeSongTitle(videoTitle || songQuery);
       await message.reply(`Done: ${resolvedTitle}`);
     } catch (error) {
-      console.error("Song command error:", error);
-      await message.reply("Sorry, I couldn't download that song right now. Please try another song name.");
+      console.error("Song command error:", getErrorText(error));
+      const friendlyMessage = getErrorText(error) || "Sorry, I couldn't download that song right now.";
+      await message.reply(friendlyMessage);
     } finally {
       await cleanupDownloadedFile(downloadedPath);
     }

@@ -1,14 +1,13 @@
-const { spawn } = require("child_process");
+const { exec } = require("child_process");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 
 const TEMP_DIR = path.resolve(process.cwd(), "temp");
-let cachedCookieFile = null;
 const YTDLP_BIN_CANDIDATES = [
   String(process.env.YTDLP_BIN || "").trim(),
-  "/usr/local/bin/yt-dlp",
   "/usr/bin/yt-dlp",
+  "/usr/local/bin/yt-dlp",
   "yt-dlp",
 ].filter(Boolean);
 
@@ -23,6 +22,14 @@ function resolveYtDlpBinary() {
   return "yt-dlp";
 }
 
+function quoteArg(value = "") {
+  return JSON.stringify(String(value));
+}
+
+function isHttpUrl(value = "") {
+  return /^https?:\/\//i.test(String(value).trim());
+}
+
 function sanitizeSongTitle(value = "") {
   const cleaned = String(value)
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
@@ -35,228 +42,104 @@ async function ensureTempDir() {
   await fs.mkdir(TEMP_DIR, { recursive: true });
 }
 
-function runYtDlp(args, timeoutMs = 180000) {
+function runExec(command, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
-    const binary = resolveYtDlpBinary();
-    const child = spawn(binary, args, {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(new Error(`Failed to start yt-dlp (${binary}): ${error.message}`));
-    });
-
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(new Error("Download timed out."));
+    exec(command, { windowsHide: true, timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(String(stderr || error.message || "").trim() || "Command failed."));
         return;
       }
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
-        return;
-      }
-      resolve({ stdout, stderr });
+      resolve({ stdout: String(stdout || ""), stderr: String(stderr || "") });
     });
   });
 }
 
 function resolveCookieArgs() {
-  const directCookieFile = String(process.env.YTDLP_COOKIE_FILE || process.env.YTDLP_COOKIES_PATH || "").trim();
-  if (directCookieFile && fsSync.existsSync(directCookieFile)) {
-    return ["--cookies", directCookieFile];
-  }
-
-  const cookieB64 = String(process.env.YTDLP_COOKIES_B64 || "").trim();
-  if (!cookieB64) return [];
-
-  try {
-    if (!cachedCookieFile) {
-      if (!fsSync.existsSync(TEMP_DIR)) {
-        fsSync.mkdirSync(TEMP_DIR, { recursive: true });
-      }
-      const cookiePath = path.join(TEMP_DIR, "yt-dlp-cookies.txt");
-      const decoded = Buffer.from(cookieB64, "base64").toString("utf8");
-      fsSync.writeFileSync(cookiePath, decoded, "utf8");
-      cachedCookieFile = cookiePath;
-    }
-    return ["--cookies", cachedCookieFile];
-  } catch {
-    return [];
-  }
+  const cookieFile = String(process.env.YTDLP_COOKIE_FILE || process.env.YTDLP_COOKIES_PATH || "").trim();
+  if (!cookieFile) return "";
+  return ` --cookies ${quoteArg(cookieFile)}`;
 }
 
 function resolveProxyArgs() {
   const proxyUrl = String(process.env.YTDLP_PROXY_URL || "").trim();
-  if (!proxyUrl) return [];
-  return ["--proxy", proxyUrl];
-}
-
-async function searchYouTubeCandidateUrls(songName, limit = 5) {
-  const query = String(songName || "").trim();
-  if (!query) throw new Error("Missing song name.");
-
-  const args = [
-    "--flat-playlist",
-    "--no-warnings",
-    "--no-playlist",
-    "--print",
-    "webpage_url",
-    `ytsearch${Math.max(1, Number(limit) || 5)}:${query}`,
-    ...resolveCookieArgs(),
-    ...resolveProxyArgs(),
-  ];
-
-  const { stdout } = await runYtDlp(args, 90000);
-  const urls = stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^https?:\/\//i.test(line));
-
-  return [...new Set(urls)];
+  if (!proxyUrl) return "";
+  return ` --proxy ${quoteArg(proxyUrl)}`;
 }
 
 async function searchYouTubeFirstVideoUrl(songName) {
   const query = String(songName || "").trim();
   if (!query) throw new Error("Missing song name.");
 
-  const endpoint = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-  const response = await fetch(endpoint, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "accept-language": "en-US,en;q=0.9",
-    },
-  });
+  const ytdlp = resolveYtDlpBinary();
+  const command =
+    `${quoteArg(ytdlp)} --no-warnings --no-playlist --print webpage_url ` +
+    `${quoteArg(`ytsearch1:${query}`)}${resolveCookieArgs()}${resolveProxyArgs()}`;
 
-  if (!response.ok) {
-    throw new Error(`YouTube search failed (HTTP ${response.status}).`);
-  }
-
-  const html = await response.text();
-  const match = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-  if (!match?.[1]) {
-    throw new Error("No YouTube result found for this query.");
-  }
-
-  return `https://www.youtube.com/watch?v=${match[1]}`;
+  const { stdout } = await runExec(command, 90000);
+  const url = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^https?:\/\//i.test(line));
+  if (!url) throw new Error("No YouTube result found for this query.");
+  return url;
 }
 
 function normalizeYtDlpError(error) {
   const raw = String(error?.message || "");
-  if (raw.includes("Requested format is not available") || raw.includes("no video formats found")) {
-    return new Error("YouTube returned results but no downloadable audio format was available.");
+  if (raw.includes("Sign in to confirm you’re not a bot") || raw.includes("Sign in to confirm you're not a bot")) {
+    return new Error("YouTube blocked this request. Configure YTDLP_COOKIE_FILE (and optionally YTDLP_PROXY_URL) then try again.");
   }
-  if (
-    raw.includes("Sign in to confirm you’re not a bot") ||
-    raw.includes("Sign in to confirm you're not a bot") ||
-    raw.includes("This helps protect our community")
-  ) {
-    return new Error(
-      "YouTube blocked this request. Configure YTDLP_COOKIE_FILE or YTDLP_COOKIES_B64 (optionally YTDLP_PROXY_URL), then try again.",
-    );
-  }
-  if (raw.includes("Failed to start yt-dlp")) {
-    return new Error("yt-dlp is not installed in runtime. Install yt-dlp in your Docker image.");
+  if (raw.toLowerCase().includes("requested format is not available")) {
+    return new Error("No compatible audio format found for this song. Try another song name.");
   }
   return error;
 }
 
-async function downloadSongAsMp3(songName) {
-  await ensureTempDir();
+function buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector = "" }) {
+  const formatPart = formatSelector ? ` --format ${quoteArg(formatSelector)}` : "";
+  return (
+    `${quoteArg(ytdlp)} -x --audio-format mp3 --audio-quality 0 --no-playlist ` +
+    `--extractor-args ${quoteArg("youtube:player_client=android,web")} ` +
+    `${formatPart} --print title --print after_move:filepath -o ${quoteArg(outputTemplate)} ${quoteArg(targetUrl)}` +
+    `${resolveCookieArgs()}${resolveProxyArgs()}`
+  );
+}
 
-  const query = String(songName || "").trim();
-  if (!query) {
-    throw new Error("Missing song name.");
-  }
-
-  let candidateUrls = [];
-  try {
-    candidateUrls = await searchYouTubeCandidateUrls(query, 5);
-  } catch {
-    candidateUrls = [];
-  }
-  if (!candidateUrls.length) {
-    candidateUrls = [await searchYouTubeFirstVideoUrl(query)];
-  }
-
-  const outputTemplate = path.join("temp", "%(id)s.%(ext)s");
-  const sharedArgs = [
-    "-x",
-    "--audio-format",
-    "mp3",
-    "--no-playlist",
-    "--socket-timeout",
-    "30",
-    "--retries",
-    "3",
-    "--force-ipv4",
-    "--print",
-    "title",
-    "--print",
-    "after_move:filepath",
-    "-o",
-    outputTemplate,
-    ...resolveCookieArgs(),
-    ...resolveProxyArgs(),
+async function runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl }) {
+  const commands = [
+    buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector: "bestaudio/best" }),
+    buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector: "" }),
   ];
 
-  const strategyArgs = [
-    ["--extractor-args", "youtube:player_client=android,web"],
-    ["--extractor-args", "youtube:player_client=ios,android"],
-    ["--extractor-args", "youtube:player_client=web_creator,android"],
-  ];
-
-  const attempts = [];
-  for (const targetUrl of candidateUrls) {
-    for (const strategy of strategyArgs) {
-      attempts.push(["--js-runtimes", "node", ...sharedArgs, ...strategy, targetUrl]);
-      attempts.push([...sharedArgs, ...strategy, targetUrl]);
-    }
-  }
-
-  let stdout = "";
   let lastError = null;
-  for (const args of attempts) {
+  for (const command of commands) {
     try {
-      const result = await runYtDlp(args);
-      stdout = result.stdout;
-      lastError = null;
-      break;
+      return await runExec(command, 240000);
     } catch (error) {
       lastError = error;
-      const message = String(error?.message || "");
-      // Keep trying if this runtime flag is unsupported.
-      if (message.includes("no such option: --js-runtimes")) {
-        continue;
-      }
-      if (message.includes("Requested format is not available")) {
-        continue;
-      }
     }
   }
+  throw lastError || new Error("Download failed.");
+}
 
-  if (!stdout) {
-    throw normalizeYtDlpError(lastError || new Error("Failed to download song."));
+async function downloadSongAsMp3(input) {
+  await ensureTempDir();
+
+  const rawInput = String(input || "").trim();
+  if (!rawInput) {
+    throw new Error("Missing song query.");
+  }
+
+  const targetUrl = isHttpUrl(rawInput) ? rawInput : await searchYouTubeFirstVideoUrl(rawInput);
+  const ytdlp = resolveYtDlpBinary();
+  const outputTemplate = path.join(TEMP_DIR, "%(id)s.%(ext)s");
+
+  let stdout = "";
+  try {
+    const result = await runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl });
+    stdout = result.stdout;
+  } catch (error) {
+    throw normalizeYtDlpError(error);
   }
 
   const lines = stdout
@@ -265,7 +148,7 @@ async function downloadSongAsMp3(songName) {
     .filter(Boolean);
 
   const filePathLine = lines[lines.length - 1];
-  const titleLine = lines.length > 1 ? lines[lines.length - 2] : query;
+  const titleLine = lines.length > 1 ? lines[lines.length - 2] : "song";
   if (!filePathLine) {
     throw new Error("Could not resolve downloaded file path.");
   }
@@ -278,6 +161,7 @@ async function downloadSongAsMp3(songName) {
   return {
     filePath: absolutePath,
     videoTitle: titleLine,
+    sourceUrl: targetUrl,
   };
 }
 
@@ -290,7 +174,6 @@ module.exports = {
   TEMP_DIR,
   sanitizeSongTitle,
   ensureTempDir,
-  runYtDlp,
   searchYouTubeFirstVideoUrl,
   downloadSongAsMp3,
   cleanupDownloadedFile,
