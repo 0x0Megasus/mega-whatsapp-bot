@@ -8,7 +8,6 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const {
   downloadSongAsMp3,
-  searchYouTubeFirstVideoUrl,
   sanitizeSongTitle,
   cleanupDownloadedFile,
 } = require("./songDownloader");
@@ -1437,8 +1436,7 @@ async function handleCommand(client, message) {
     let downloadedPath = null;
     try {
       await message.reply(`Downloading song: ${songQuery}`);
-      const songUrl = await searchYouTubeFirstVideoUrl(songQuery);
-      const { filePath, videoTitle } = await downloadSongAsMp3(songUrl);
+      const { filePath, videoTitle } = await downloadSongAsMp3(songQuery);
       downloadedPath = filePath;
 
       const media = MessageMedia.fromFilePath(downloadedPath);
