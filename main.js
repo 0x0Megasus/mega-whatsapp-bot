@@ -880,7 +880,7 @@ function getHelpText() {
     "",
     "Core Commands:",
     `${COMMAND_PREFIX}help`,
-    `${COMMAND_PREFIX}sticker (DM or linked group, send with image/video)`,
+    `${COMMAND_PREFIX}sticker / ${COMMAND_PREFIX}s (DM or linked group, send with image/video)`,
     "",
     "Games:",
     `${COMMAND_PREFIX}mafia help`,
@@ -1363,12 +1363,12 @@ async function handleCommand(client, message) {
     return;
   }
 
-  if (command === "sticker") {
+  if (command === "sticker" || command === "s") {
     if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
       return;
     }
     if (!message.hasMedia) {
-      await message.reply(`Send an image or video with caption ${COMMAND_PREFIX}sticker`);
+      await message.reply(`Send an image or video with caption ${COMMAND_PREFIX}sticker or ${COMMAND_PREFIX}s`);
       return;
     }
 
