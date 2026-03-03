@@ -337,6 +337,30 @@ function configureFfmpegPath() {
   console.warn("FFmpeg not configured. Video stickers will fail until FFmpeg is installed.");
 }
 
+async function removeIfExists(filePath) {
+  try {
+    await fs.unlink(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function cleanupChromiumProfileLocks(localAuthPath, clientId) {
+  const sessionDir = path.join(localAuthPath, `session-${clientId || "default"}`);
+  const candidates = [
+    path.join(sessionDir, "SingletonLock"),
+    path.join(sessionDir, "SingletonSocket"),
+    path.join(sessionDir, "SingletonCookie"),
+    path.join(sessionDir, "Default", "SingletonLock"),
+    path.join(sessionDir, "Default", "SingletonSocket"),
+    path.join(sessionDir, "Default", "SingletonCookie"),
+  ];
+
+  for (const lockPath of candidates) {
+    await removeIfExists(lockPath);
+  }
+}
+
 function getMediaGroupId(message) {
   return message?._data?.mediaGroupId || message?.mediaGroupId || null;
 }
@@ -1561,9 +1585,15 @@ async function start() {
   configureFfmpegPath();
   startHealthServer();
 
+  const localAuthPath = path.resolve(process.env.LOCAL_AUTH_PATH || path.join(DATA_DIR, ".wwebjs_auth"));
+  const localAuthClientId = process.env.LOCAL_AUTH_CLIENT_ID || "default";
+  await fs.mkdir(localAuthPath, { recursive: true });
+  await cleanupChromiumProfileLocks(localAuthPath, localAuthClientId);
+
   const client = new Client({
     authStrategy: new LocalAuth({
-      dataPath: process.env.LOCAL_AUTH_PATH || ".wwebjs_auth",
+      clientId: localAuthClientId,
+      dataPath: localAuthPath,
     }),
     puppeteer: {
       headless: true,
@@ -1583,7 +1613,7 @@ async function start() {
   client.on("ready", async () => {
     console.log("Bot is ready.");
     botReady = true;
-    await markCurrentMembersAsWelcomed(client);111
+    await markCurrentMembersAsWelcomed(client);
   });
 
   client.on("message_create", async (message) => {
