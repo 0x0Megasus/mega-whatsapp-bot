@@ -104,6 +104,25 @@ async function searchYouTubeFirstVideoUrl(songName) {
   return url;
 }
 
+async function searchYouTubeCandidateUrls(songName, limit = 5) {
+  const query = String(songName || "").trim();
+  if (!query) throw new Error("Missing song name.");
+
+  const count = Math.max(1, Math.min(10, Number(limit) || 5));
+  const ytdlp = resolveYtDlpBinary();
+  const command =
+    `${quoteArg(ytdlp)} --no-warnings --no-playlist --flat-playlist --print webpage_url ` +
+    `${quoteArg(`ytsearch${count}:${query}`)}${resolveCookieArgs()}${resolveProxyArgs()}`;
+
+  const { stdout } = await runExec(command, 90000);
+  const urls = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^https?:\/\//i.test(line));
+
+  return [...new Set(urls)];
+}
+
 function normalizeYtDlpError(error) {
   const raw = String(error?.message || "");
   if (raw.includes("Sign in to confirm you’re not a bot") || raw.includes("Sign in to confirm you're not a bot")) {
@@ -177,16 +196,34 @@ async function downloadSongAsMp3(input) {
     throw new Error("Missing song query.");
   }
 
-  const targetUrl = isHttpUrl(rawInput) ? rawInput : await searchYouTubeFirstVideoUrl(rawInput);
+  const candidateUrls = isHttpUrl(rawInput)
+    ? [rawInput]
+    : await searchYouTubeCandidateUrls(rawInput, 5);
+  if (!candidateUrls.length) {
+    throw new Error("No YouTube result found for this query.");
+  }
+
   const ytdlp = resolveYtDlpBinary();
   const outputTemplate = path.join(TEMP_DIR, "%(id)s.%(ext)s");
 
+  let selectedUrl = "";
   let stdout = "";
-  try {
-    const result = await runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl });
-    stdout = result.stdout;
-  } catch (error) {
-    throw normalizeYtDlpError(error);
+  let lastError = null;
+
+  for (const url of candidateUrls) {
+    try {
+      const result = await runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl: url });
+      selectedUrl = url;
+      stdout = result.stdout;
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!stdout) {
+    throw normalizeYtDlpError(lastError || new Error("Failed to download song."));
   }
 
   const lines = stdout
@@ -208,7 +245,7 @@ async function downloadSongAsMp3(input) {
   return {
     filePath: absolutePath,
     videoTitle: titleLine,
-    sourceUrl: targetUrl,
+    sourceUrl: selectedUrl || candidateUrls[0],
   };
 }
 
@@ -221,6 +258,7 @@ module.exports = {
   TEMP_DIR,
   sanitizeSongTitle,
   ensureTempDir,
+  searchYouTubeCandidateUrls,
   searchYouTubeFirstVideoUrl,
   downloadSongAsMp3,
   cleanupDownloadedFile,

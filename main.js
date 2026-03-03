@@ -1592,7 +1592,16 @@ async function start() {
   configureFfmpegPath();
   startHealthServer();
 
-  const localAuthPath = path.resolve(process.env.LOCAL_AUTH_PATH || path.join(DATA_DIR, ".wwebjs_auth"));
+  const requestedAuthPath = process.env.LOCAL_AUTH_PATH || path.join(DATA_DIR, ".wwebjs_auth");
+  let localAuthPath = path.resolve(requestedAuthPath);
+  const dataDirResolved = path.resolve(DATA_DIR);
+  const shouldForcePersistentAuth = String(process.env.FORCE_PERSISTENT_AUTH || "true").toLowerCase() !== "false";
+  const pathStartsWithApp = localAuthPath === "/app" || localAuthPath.startsWith("/app/");
+  const dataDirIsUsable = dataDirResolved === "/data" || dataDirResolved.startsWith("/data/");
+  if (shouldForcePersistentAuth && pathStartsWithApp && dataDirIsUsable) {
+    localAuthPath = path.join(dataDirResolved, ".wwebjs_auth");
+    console.log(`LOCAL_AUTH_PATH remapped to persistent volume: ${localAuthPath}`);
+  }
   const localAuthClientId = process.env.LOCAL_AUTH_CLIENT_ID || "default";
   await fs.mkdir(localAuthPath, { recursive: true });
   await cleanupChromiumProfileLocks(localAuthPath, localAuthClientId);
