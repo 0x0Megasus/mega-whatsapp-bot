@@ -4,6 +4,24 @@ const fsSync = require("fs");
 const path = require("path");
 
 const TEMP_DIR = path.resolve(process.cwd(), "temp");
+let cachedCookieFile = null;
+const YTDLP_BIN_CANDIDATES = [
+  String(process.env.YTDLP_BIN || "").trim(),
+  "/usr/local/bin/yt-dlp",
+  "/usr/bin/yt-dlp",
+  "yt-dlp",
+].filter(Boolean);
+
+function resolveYtDlpBinary() {
+  for (const candidate of YTDLP_BIN_CANDIDATES) {
+    if (candidate.includes("/") || candidate.includes("\\")) {
+      if (fsSync.existsSync(candidate)) return candidate;
+      continue;
+    }
+    return candidate;
+  }
+  return "yt-dlp";
+}
 
 function sanitizeSongTitle(value = "") {
   const cleaned = String(value)
@@ -19,7 +37,8 @@ async function ensureTempDir() {
 
 function runYtDlp(args, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
-    const child = spawn("yt-dlp", args, {
+    const binary = resolveYtDlpBinary();
+    const child = spawn(binary, args, {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -43,7 +62,7 @@ function runYtDlp(args, timeoutMs = 180000) {
 
     child.on("error", (error) => {
       clearTimeout(timer);
-      reject(new Error(`Failed to start yt-dlp: ${error.message}`));
+      reject(new Error(`Failed to start yt-dlp (${binary}): ${error.message}`));
     });
 
     child.on("close", (code) => {
@@ -62,9 +81,28 @@ function runYtDlp(args, timeoutMs = 180000) {
 }
 
 function resolveCookieArgs() {
-  const cookieFile = String(process.env.YTDLP_COOKIE_FILE || "").trim();
-  if (!cookieFile) return [];
-  return ["--cookies", cookieFile];
+  const directCookieFile = String(process.env.YTDLP_COOKIE_FILE || process.env.YTDLP_COOKIES_PATH || "").trim();
+  if (directCookieFile && fsSync.existsSync(directCookieFile)) {
+    return ["--cookies", directCookieFile];
+  }
+
+  const cookieB64 = String(process.env.YTDLP_COOKIES_B64 || "").trim();
+  if (!cookieB64) return [];
+
+  try {
+    if (!cachedCookieFile) {
+      if (!fsSync.existsSync(TEMP_DIR)) {
+        fsSync.mkdirSync(TEMP_DIR, { recursive: true });
+      }
+      const cookiePath = path.join(TEMP_DIR, "yt-dlp-cookies.txt");
+      const decoded = Buffer.from(cookieB64, "base64").toString("utf8");
+      fsSync.writeFileSync(cookiePath, decoded, "utf8");
+      cachedCookieFile = cookiePath;
+    }
+    return ["--cookies", cachedCookieFile];
+  } catch {
+    return [];
+  }
 }
 
 function resolveProxyArgs() {
@@ -128,8 +166,14 @@ function normalizeYtDlpError(error) {
   if (raw.includes("Requested format is not available") || raw.includes("no video formats found")) {
     return new Error("YouTube returned results but no downloadable audio format was available.");
   }
-  if (raw.includes("Sign in to confirm you’re not a bot")) {
-    return new Error("YouTube blocked this request. Configure YTDLP_COOKIE_FILE (and optionally YTDLP_PROXY_URL) then try again.");
+  if (
+    raw.includes("Sign in to confirm you’re not a bot") ||
+    raw.includes("Sign in to confirm you're not a bot") ||
+    raw.includes("This helps protect our community")
+  ) {
+    return new Error(
+      "YouTube blocked this request. Configure YTDLP_COOKIE_FILE or YTDLP_COOKIES_B64 (optionally YTDLP_PROXY_URL), then try again.",
+    );
   }
   if (raw.includes("Failed to start yt-dlp")) {
     return new Error("yt-dlp is not installed in runtime. Install yt-dlp in your Docker image.");
