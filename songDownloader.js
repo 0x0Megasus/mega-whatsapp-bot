@@ -7,8 +7,8 @@ const TEMP_DIR = path.resolve(process.cwd(), "temp");
 let cachedCookieFile = null;
 const YTDLP_BIN_CANDIDATES = [
   String(process.env.YTDLP_BIN || "").trim(),
-  "/usr/bin/yt-dlp",
   "/usr/local/bin/yt-dlp",
+  "/usr/bin/yt-dlp",
   "yt-dlp",
 ].filter(Boolean);
 
@@ -115,20 +115,47 @@ function normalizeYtDlpError(error) {
   return error;
 }
 
-function buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector = "" }) {
+function buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector = "", extractorArgs = "" }) {
   const formatPart = formatSelector ? ` --format ${quoteArg(formatSelector)}` : "";
+  const extractorPart = extractorArgs ? ` --extractor-args ${quoteArg(extractorArgs)}` : "";
   return (
     `${quoteArg(ytdlp)} -x --audio-format mp3 --audio-quality 0 --no-playlist ` +
-    `--extractor-args ${quoteArg("youtube:player_client=android,web")} ` +
-    `${formatPart} --print title --print after_move:filepath -o ${quoteArg(outputTemplate)} ${quoteArg(targetUrl)}` +
+    `${extractorPart}${formatPart} --print title --print after_move:filepath ` +
+    `-o ${quoteArg(outputTemplate)} ${quoteArg(targetUrl)}` +
     `${resolveCookieArgs()}${resolveProxyArgs()}`
   );
 }
 
 async function runDownloadWithFallback({ ytdlp, outputTemplate, targetUrl }) {
   const commands = [
-    buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector: "bestaudio/best" }),
-    buildDownloadCommand({ ytdlp, outputTemplate, targetUrl, formatSelector: "" }),
+    buildDownloadCommand({
+      ytdlp,
+      outputTemplate,
+      targetUrl,
+      formatSelector: "bestaudio/best",
+      extractorArgs: "youtube:player_client=android,web,mweb",
+    }),
+    buildDownloadCommand({
+      ytdlp,
+      outputTemplate,
+      targetUrl,
+      formatSelector: "",
+      extractorArgs: "youtube:player_client=android,web,mweb",
+    }),
+    buildDownloadCommand({
+      ytdlp,
+      outputTemplate,
+      targetUrl,
+      formatSelector: "bestaudio/best",
+      extractorArgs: "",
+    }),
+    buildDownloadCommand({
+      ytdlp,
+      outputTemplate,
+      targetUrl,
+      formatSelector: "",
+      extractorArgs: "",
+    }),
   ];
 
   let lastError = null;
