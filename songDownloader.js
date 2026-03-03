@@ -4,6 +4,7 @@ const fsSync = require("fs");
 const path = require("path");
 
 const TEMP_DIR = path.resolve(process.cwd(), "temp");
+let cachedCookieFile = null;
 const YTDLP_BIN_CANDIDATES = [
   String(process.env.YTDLP_BIN || "").trim(),
   "/usr/bin/yt-dlp",
@@ -56,8 +57,27 @@ function runExec(command, timeoutMs = 180000) {
 
 function resolveCookieArgs() {
   const cookieFile = String(process.env.YTDLP_COOKIE_FILE || process.env.YTDLP_COOKIES_PATH || "").trim();
-  if (!cookieFile) return "";
-  return ` --cookies ${quoteArg(cookieFile)}`;
+  if (cookieFile && fsSync.existsSync(cookieFile)) {
+    return ` --cookies ${quoteArg(cookieFile)}`;
+  }
+
+  const cookieB64 = String(process.env.YTDLP_COOKIES_B64 || "").trim();
+  if (!cookieB64) return "";
+
+  try {
+    if (!cachedCookieFile) {
+      if (!fsSync.existsSync(TEMP_DIR)) {
+        fsSync.mkdirSync(TEMP_DIR, { recursive: true });
+      }
+      const decoded = Buffer.from(cookieB64, "base64").toString("utf8");
+      const cookiePath = path.join(TEMP_DIR, "yt-dlp-cookies.txt");
+      fsSync.writeFileSync(cookiePath, decoded, "utf8");
+      cachedCookieFile = cookiePath;
+    }
+    return ` --cookies ${quoteArg(cachedCookieFile)}`;
+  } catch {
+    return "";
+  }
 }
 
 function resolveProxyArgs() {
