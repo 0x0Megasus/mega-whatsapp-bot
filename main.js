@@ -5,6 +5,7 @@ const http = require("http");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
+const { downloadSongAsMp3, sanitizeSongTitle, cleanupDownloadedFile } = require("./songDownloader");
 
 let WWebJSUtil = null;
 try {
@@ -1378,6 +1379,39 @@ async function handleCommand(client, message) {
     return;
   }
 
+  if (command === "song") {
+    if (!isPrivateMessage(message) && !ensureGroupOnly(message)) {
+      return;
+    }
+
+    const songQuery = parts.join(" ").trim();
+    if (!songQuery) {
+      await message.reply("Please provide a song name. Example: .song Eminem Lose Yourself");
+      return;
+    }
+
+    let downloadedPath = null;
+    try {
+      await message.reply(`Downloading song: ${songQuery}`);
+      const { filePath, videoTitle } = await downloadSongAsMp3(songQuery);
+      downloadedPath = filePath;
+
+      const media = MessageMedia.fromFilePath(downloadedPath);
+      await client.sendMessage(message.from, media, {
+        sendAudioAsVoice: false,
+      });
+
+      const resolvedTitle = sanitizeSongTitle(videoTitle || songQuery);
+      await message.reply(`Done: ${resolvedTitle}`);
+    } catch (error) {
+      console.error("Song command error:", error);
+      await message.reply("Sorry, I couldn't download that song right now. Please try another song name.");
+    } finally {
+      await cleanupDownloadedFile(downloadedPath);
+    }
+    return;
+  }
+
   if (isPrivateMessage(message)) {
     if (command === "mafia") {
       await handleMafiaCommand(client, message, parts, { fromPrivate: true });
@@ -1534,7 +1568,7 @@ async function start() {
   client.on("ready", async () => {
     console.log("Bot is ready.");
     botReady = true;
-    await markCurrentMembersAsWelcomed(client);
+    await markCurrentMembersAsWelcomed(client);111
   });
 
   client.on("message_create", async (message) => {
