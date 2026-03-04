@@ -6,6 +6,7 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const cheerio = require("cheerio");
 
 let WWebJSUtil = null;
 try {
@@ -19,12 +20,15 @@ const MAX_TARGET_GROUPS = 4;
 const COMMAND_PREFIX = process.env.COMMAND_PREFIX || ".";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
+const COURSE_DOWNLOAD_DIR = process.env.COURSE_DOWNLOAD_DIR || path.join(DATA_DIR, "cources-downloads");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
 let botReady = false;
 let latestQrText = null;
+const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOUT_MS || 180000);
+const DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS = Number(process.env.COURCES_DOWNLOAD_TIMEOUT_MS || 120000);
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -295,6 +299,464 @@ function getErrorText(error) {
   } catch {
     return String(error);
   }
+}
+
+function normalizeText(value = "") {
+  return String(value).replace(/\s+/g, " ").trim();
+}
+
+function getUcaConfig() {
+  const api = String(process.env.UCA_API || process.env.api || "https://ecampus-flsh.uca.ma/login/index.php").trim();
+  const username = String(process.env.UCA_USERNAME || process.env.username || "").trim();
+  const password = String(process.env.UCA_PASSWORD || process.env.password || "").trim();
+  const moodleSession = String(process.env.UCA_MOODLESESSION || process.env.moodlesession || "").trim();
+
+  if (!api) throw new Error("Missing UCA_API/api");
+  if (!moodleSession && (!username || !password)) {
+    throw new Error("Set UCA_MOODLESESSION or set UCA_USERNAME + UCA_PASSWORD");
+  }
+
+  return { api, username, password, moodleSession };
+}
+
+function getSetCookies(headers) {
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+  const raw = headers.get("set-cookie");
+  if (!raw) return [];
+  return raw.split(/,(?=\s*[^;,=\s]+=[^;,]+)/g);
+}
+
+function mergeCookies(existingCookieHeader = "", nextSetCookieValues = []) {
+  const jar = new Map();
+  if (existingCookieHeader) {
+    for (const piece of existingCookieHeader.split(";")) {
+      const [k, ...v] = piece.trim().split("=");
+      if (k) jar.set(k, v.join("="));
+    }
+  }
+  for (const cookie of nextSetCookieValues) {
+    const first = cookie.split(";")[0];
+    const [k, ...v] = first.split("=");
+    if (k) jar.set(k.trim(), v.join("=").trim());
+  }
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+function isRedirectStatus(status) {
+  return status >= 300 && status < 400;
+}
+
+async function fetchWithCookies(url, options, cookieHeader) {
+  const headers = { ...(options?.headers || {}) };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
+    redirect: "manual",
+    signal: options?.signal || AbortSignal.timeout(DEFAULT_COURCES_FETCH_TIMEOUT_MS),
+  });
+  const mergedCookie = mergeCookies(cookieHeader, getSetCookies(response.headers));
+  return { response, cookieHeader: mergedCookie };
+}
+
+async function followRedirectChain(startUrl, cookieHeader, userAgent, maxHops = 10) {
+  let url = startUrl;
+  let hops = 0;
+  while (hops < maxHops) {
+    const { response, cookieHeader: nextCookie } = await fetchWithCookies(
+      url,
+      {
+        method: "GET",
+        headers: { "User-Agent": userAgent },
+      },
+      cookieHeader,
+    );
+    cookieHeader = nextCookie;
+
+    if (!isRedirectStatus(response.status)) {
+      const html = await response.text();
+      return { finalUrl: url, finalResponse: response, html, cookieHeader };
+    }
+
+    const location = response.headers.get("location");
+    if (!location) {
+      const html = await response.text();
+      return { finalUrl: url, finalResponse: response, html, cookieHeader };
+    }
+    url = new URL(location, url).toString();
+    hops += 1;
+  }
+  throw new Error("Too many redirects while trying to reach dashboard");
+}
+
+function parseCoursesFromDashboard(html, baseUrl) {
+  const $ = cheerio.load(html);
+  const courses = new Map();
+  const selectors = [
+    'a[href*="/course/view.php?id="]',
+    ".coursebox a",
+    ".card.dashboard-card a",
+    ".card-dashboard-course a",
+    '[data-region="course-content"] a',
+  ];
+
+  for (const selector of selectors) {
+    $(selector).each((_, element) => {
+      const href = $(element).attr("href");
+      const text = normalizeText($(element).text());
+      if (!href || !text) return;
+
+      let absoluteHref;
+      try {
+        absoluteHref = new URL(href, baseUrl).toString();
+      } catch {
+        return;
+      }
+
+      const idMatch = absoluteHref.match(/[?&]id=(\d+)/);
+      const key = idMatch ? idMatch[1] : absoluteHref;
+      if (!courses.has(key)) {
+        courses.set(key, {
+          id: idMatch ? idMatch[1] : null,
+          name: text,
+          url: absoluteHref,
+        });
+      }
+    });
+  }
+  return Array.from(courses.values());
+}
+
+function looksLikeM2OrM4Course(courseName = "") {
+  return /\bM(?:2|4)(?:\.\d+)?(?!\d)/i.test(courseName);
+}
+
+function extractModuleAndProfessor(courseName = "") {
+  const moduleMatch = courseName.match(/\bM(?:2|4)(?:\.\d+)?(?!\d)/i);
+  const profMatch = courseName.match(/\bPr\.?\s*([^\[\]|]+)/i);
+  const module = moduleMatch ? moduleMatch[0].toUpperCase() : "Unknown Module";
+  const professor = profMatch ? normalizeText(profMatch[1]).replace(/[.\s]+$/g, "") : "Unknown Professor";
+  return { module, professor };
+}
+
+async function listDocumentsForM2M4Courses(courses, cookieHeader, userAgent, baseUrl) {
+  const targetCourses = courses.filter((course) => looksLikeM2OrM4Course(course.name));
+  const groupedDocs = new Map();
+
+  const results = await Promise.all(
+    targetCourses.map(async (course) => {
+      const groupInfo = extractModuleAndProfessor(course.name);
+      try {
+        const page = await followRedirectChain(course.url, cookieHeader, userAgent);
+        const $ = cheerio.load(page.html);
+        const links = [];
+
+        $("#page-content a[href]").each((_, element) => {
+          const href = String($(element).attr("href") || "").trim();
+          if (!href || href.startsWith("#") || /^javascript:/i.test(href) || /^mailto:/i.test(href)) return;
+
+          let absoluteHref;
+          try {
+            absoluteHref = new URL(href, baseUrl).toString();
+          } catch {
+            return;
+          }
+
+          const instanceName = normalizeText($(element).find("span.instancename").first().text());
+          const fallbackName = normalizeText($(element).text());
+          const fileName = instanceName || fallbackName || "resource";
+          links.push({ url: absoluteHref, name: fileName });
+        });
+
+        return { groupInfo, links };
+      } catch {
+        return { groupInfo, links: [] };
+      }
+    }),
+  );
+
+  for (const item of results) {
+    if (!item.links.length) continue;
+    const key = `${item.groupInfo.module}|||${item.groupInfo.professor}`;
+    if (!groupedDocs.has(key)) {
+      groupedDocs.set(key, {
+        module: item.groupInfo.module,
+        professor: item.groupInfo.professor,
+        links: new Map(),
+      });
+    }
+
+    for (const link of item.links) {
+      groupedDocs.get(key).links.set(link.url, link.name);
+    }
+  }
+
+  return Array.from(groupedDocs.values())
+    .map((group) => ({
+      ...group,
+      links: Array.from(group.links.entries()).map(([url, name]) => ({ name, url })),
+    }))
+    .filter((group) => group.links.length > 0);
+}
+
+function parseLoginError(html) {
+  const $ = cheerio.load(html);
+  const candidates = ['[data-region="alert"]', ".alert-danger", ".loginerrors", ".error", ".invalid-feedback"];
+  for (const selector of candidates) {
+    const text = normalizeText($(selector).first().text());
+    if (text) return text;
+  }
+  return "";
+}
+
+async function fetchUcaCourseLinks() {
+  const cfg = getUcaConfig();
+  const userAgent = "whatsappMegaBot-cources/1.0";
+  const baseUrl = `${new URL(cfg.api).protocol}//${new URL(cfg.api).host}`;
+  const loginPath = new URL(cfg.api).pathname;
+  let cookieHeader = "";
+  let dashboardStep = null;
+
+  if (cfg.moodleSession) {
+    dashboardStep = await followRedirectChain(`${baseUrl}/my/`, `MoodleSession=${cfg.moodleSession}`, userAgent);
+    const sessionPath = new URL(dashboardStep.finalUrl).pathname;
+    if (sessionPath !== loginPath) {
+      cookieHeader = dashboardStep.cookieHeader;
+    } else {
+      dashboardStep = null;
+    }
+  }
+
+  if (!dashboardStep) {
+    const loginPageStep = await fetchWithCookies(
+      cfg.api,
+      { method: "GET", headers: { "User-Agent": userAgent } },
+      "",
+    );
+    const loginHtml = await loginPageStep.response.text();
+    const $login = cheerio.load(loginHtml);
+    const logintoken = String($login('input[name="logintoken"]').attr("value") || "").trim();
+    if (!logintoken) {
+      throw new Error("Could not read login token from UCA login page");
+    }
+
+    cookieHeader = loginPageStep.cookieHeader;
+    const formBody = new URLSearchParams({
+      username: cfg.username,
+      password: cfg.password,
+      logintoken,
+    });
+
+    const loginPost = await fetchWithCookies(
+      cfg.api,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": userAgent,
+        },
+        body: formBody,
+      },
+      cookieHeader,
+    );
+    cookieHeader = loginPost.cookieHeader;
+    const firstLocation = loginPost.response.headers.get("location");
+    const startUrl = firstLocation ? new URL(firstLocation, baseUrl).toString() : `${baseUrl}/my/`;
+    dashboardStep = await followRedirectChain(startUrl, cookieHeader, userAgent);
+
+    const dashboardPath = new URL(dashboardStep.finalUrl).pathname;
+    if (dashboardPath === loginPath) {
+      const details = parseLoginError(dashboardStep.html);
+      throw new Error(`Authentication failed${details ? ` (${details})` : ""}`);
+    }
+  }
+
+  const courses = parseCoursesFromDashboard(dashboardStep.html, baseUrl);
+  if (!courses.length) {
+    throw new Error("No courses found");
+  }
+
+  const groups = await listDocumentsForM2M4Courses(courses, dashboardStep.cookieHeader, userAgent, baseUrl);
+  const urls = [];
+  const lines = ["*Cources Result*", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
+
+  if (!groups.length) {
+    lines.push("No file URLs found for M2/M4 courses.");
+    return { text: lines.join("\n"), urls, moodleSession: cfg.moodleSession };
+  }
+
+  for (const group of groups) {
+    lines.push(`${group.module} | ${group.professor}`);
+    for (let i = 0; i < group.links.length; i += 1) {
+      const link = group.links[i];
+      lines.push(`${i + 1}. ${link.name}: ${link.url}`);
+      urls.push(link.url);
+    }
+    lines.push("");
+  }
+
+  return { text: lines.join("\n"), urls, moodleSession: cfg.moodleSession };
+}
+
+function sanitizeFileName(name = "file") {
+  return String(name)
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180) || "file";
+}
+
+function fileNameFromUrl(value = "") {
+  try {
+    const parsed = new URL(value);
+    const base = decodeURIComponent(path.basename(parsed.pathname || ""));
+    return sanitizeFileName(base || "file");
+  } catch {
+    return "file";
+  }
+}
+
+function fileNameFromContentDisposition(header = "") {
+  if (!header) return "";
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return sanitizeFileName(decodeURIComponent(utf8Match[1].trim()));
+    } catch {
+      return sanitizeFileName(utf8Match[1].trim());
+    }
+  }
+  const plainMatch = header.match(/filename="?([^";]+)"?/i);
+  if (plainMatch?.[1]) return sanitizeFileName(plainMatch[1].trim());
+  return "";
+}
+
+async function downloadCourseFile(url, index, total, moodleSession) {
+  const headers = {};
+  if (moodleSession) headers.Cookie = `MoodleSession=${moodleSession}`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers,
+    redirect: "follow",
+    signal: AbortSignal.timeout(DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const disposition = response.headers.get("content-disposition") || "";
+  const candidateName = fileNameFromContentDisposition(disposition) || fileNameFromUrl(response.url || url);
+  const prefix = String(index + 1).padStart(String(total).length, "0");
+  const finalName = sanitizeFileName(`${prefix}-${candidateName || "file"}`);
+  const outputPath = path.join(COURSE_DOWNLOAD_DIR, finalName);
+  const data = Buffer.from(await response.arrayBuffer());
+
+  await fs.writeFile(outputPath, data);
+  return { fileName: finalName, outputPath, bytes: data.length };
+}
+
+function toMessageChunks(text = "", maxLen = 3500) {
+  if (!text) return [];
+  const lines = text.split("\n");
+  const chunks = [];
+  let current = "";
+  for (const line of lines) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > maxLen) {
+      if (current) chunks.push(current);
+      if (line.length > maxLen) {
+        for (let i = 0; i < line.length; i += maxLen) {
+          chunks.push(line.slice(i, i + maxLen));
+        }
+        current = "";
+      } else {
+        current = line;
+      }
+    } else {
+      current = next;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function sendTextInChunks(client, jid, text) {
+  const chunks = toMessageChunks(text);
+  for (const chunk of chunks) {
+    if (chunk.trim()) await client.sendMessage(jid, chunk);
+  }
+}
+
+async function handleCourcesCommand(client, message, args) {
+  if (!(await isAdminMessage(message))) {
+    await message.reply("Only bot owner can use this command.");
+    return;
+  }
+
+  const ownerJid = getSenderId(message);
+  const sub = (args[0] || "").toLowerCase();
+  const shouldDownload = sub === "download" || sub === "dl";
+
+  if (!isPrivateMessage(message)) {
+    await message.reply("Processing .cources. I will send the result in your DM only.");
+  }
+
+  await client.sendMessage(
+    ownerJid,
+    shouldDownload
+      ? "Fetching courses and downloading linked files, please wait..."
+      : "Fetching courses, please wait...",
+  );
+
+  const result = await fetchUcaCourseLinks();
+  await sendTextInChunks(client, ownerJid, result.text);
+
+  if (!shouldDownload) return;
+  if (!result.urls.length) {
+    await client.sendMessage(ownerJid, "No URLs found, nothing to download.");
+    return;
+  }
+
+  await fs.mkdir(COURSE_DOWNLOAD_DIR, { recursive: true });
+  let successCount = 0;
+  const failures = [];
+  for (let i = 0; i < result.urls.length; i += 1) {
+    const targetUrl = result.urls[i];
+    try {
+      const downloaded = await downloadCourseFile(targetUrl, i, result.urls.length, result.moodleSession);
+      successCount += 1;
+      await client.sendMessage(
+        ownerJid,
+        `Downloaded ${successCount}/${result.urls.length}: ${downloaded.fileName} (${downloaded.bytes} bytes)`,
+      );
+    } catch (error) {
+      failures.push(`${i + 1}. ${targetUrl} -> ${getErrorText(error)}`);
+    }
+  }
+
+  const summary = [
+    "*Cources Download Summary*",
+    `Saved in: ${COURSE_DOWNLOAD_DIR}`,
+    `Success: ${successCount}/${result.urls.length}`,
+    `Failed: ${failures.length}`,
+  ];
+  if (!result.moodleSession) {
+    summary.push("Warning: no moodlesession configured. Set UCA_MOODLESESSION for protected files.");
+  }
+  if (failures.length) {
+    summary.push("");
+    summary.push("Failures:");
+    summary.push(...failures.slice(0, 20));
+    if (failures.length > 20) summary.push(`... and ${failures.length - 20} more`);
+  }
+
+  await sendTextInChunks(client, ownerJid, summary.join("\n"));
 }
 
 function configureFfmpegPath() {
@@ -890,6 +1352,7 @@ function getHelpText() {
     `${COMMAND_PREFIX}kick @user (group only)`,
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
+    `${COMMAND_PREFIX}cources [download] (result sent to owner DM only)`,
     `${COMMAND_PREFIX}resetstore`,
   ].join("\n");
 }
@@ -1413,6 +1876,20 @@ async function handleCommand(client, message) {
     if (totalSources > 1) {
       await message.reply(`Done. Converted ${successCount}/${totalSources} to stickers.`);
       return;
+    }
+    return;
+  }
+
+  if (command === "cources") {
+    try {
+      await handleCourcesCommand(client, message, parts);
+    } catch (error) {
+      const ownerJid = getSenderId(message);
+      await client.sendMessage(ownerJid, `Failed to run ${COMMAND_PREFIX}cources: ${getErrorText(error)}`);
+      if (!isPrivateMessage(message)) {
+        await message.reply("Failed to process .cources. Check your DM for details.");
+      }
+      console.error("Cources command error:", error);
     }
     return;
   }
