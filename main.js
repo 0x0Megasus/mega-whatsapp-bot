@@ -627,13 +627,13 @@ async function fetchUcaCourseLinks() {
   let globalId = 1;
   const entries = [];
   for (const group of groups) {
-    lines.push("-----------");
+    lines.push("────────────────────────────");
     lines.push(`${group.professor}`);
     lines.push(`${group.module}`);
-    lines.push("-----------");
+    lines.push("────────────────────────────");
     for (let i = 0; i < group.links.length; i += 1) {
       const link = group.links[i];
-      lines.push(`${globalId}. ${link.name}`);
+      lines.push(`ID ${globalId}: ${link.name}`);
       lines.push(`${link.url}`);
       entries.push({
         id: globalId,
@@ -647,7 +647,7 @@ async function fetchUcaCourseLinks() {
     lines.push("");
   }
 
-  lines.push(`Tip: ${COMMAND_PREFIX}cources download M2.3 1,2,3`);
+  lines.push(`Tip: ${COMMAND_PREFIX}cources download <id>`);
   return { text: lines.join("\n"), entries, authCookieHeader: dashboardStep.cookieHeader || "" };
 }
 
@@ -709,35 +709,12 @@ async function downloadCourseFile(url, index, total, authCookieHeader) {
   return { fileName: finalName, outputPath, bytes: data.length };
 }
 
-function normalizeQuery(value = "") {
-  return String(value).toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-function parseDownloadSelection(raw = "") {
+function parseDownloadIds(raw = "") {
   const input = String(raw || "").trim();
-  const moduleMatch = input.match(/\b(M\d+(?:\.\d+)?)\b/i);
-  const moduleCode = moduleMatch ? moduleMatch[1].toUpperCase() : "";
   const numberMatches = [...input.matchAll(/#?(\d+)/g)]
     .map((m) => Number(m[1]))
     .filter((n) => Number.isInteger(n) && n > 0);
-  const ids = [...new Set(numberMatches)];
-  return { moduleCode, ids };
-}
-
-function selectCourcesTargets(entries, selection) {
-  const hasModule = Boolean(selection?.moduleCode);
-  const hasIds = Array.isArray(selection?.ids) && selection.ids.length > 0;
-  if (!hasModule && !hasIds) return [];
-
-  let filtered = entries;
-  if (hasModule) {
-    filtered = filtered.filter((entry) => normalizeQuery(entry.module) === normalizeQuery(selection.moduleCode));
-  }
-  if (hasIds) {
-    const wanted = new Set(selection.ids);
-    filtered = filtered.filter((entry) => wanted.has(entry.id));
-  }
-  return filtered;
+  return [...new Set(numberMatches)];
 }
 
 async function cleanupCourseDownloadDir() {
@@ -804,7 +781,7 @@ async function handleCourcesCommand(client, message, args) {
     return;
   }
   if (!targetQuery) {
-    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download M2.3 1,2,3`);
+    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download <id>`);
     return;
   }
   if (!result.entries.length) {
@@ -812,51 +789,51 @@ async function handleCourcesCommand(client, message, args) {
     return;
   }
 
-  const selection = parseDownloadSelection(targetQuery);
-  const selectedEntries = selectCourcesTargets(result.entries, selection);
-  if (!selectedEntries.length) {
+  const ids = parseDownloadIds(targetQuery);
+  if (!ids.length) {
+    await client.sendMessage(ownerJid, `Invalid id. Use: ${COMMAND_PREFIX}cources download <id>`);
+    return;
+  }
+  if (ids.length > 1) {
+    await client.sendMessage(ownerJid, "Use one id at a time to avoid conflicts.");
+    return;
+  }
+
+  const selectedEntry = result.entries.find((entry) => entry.id === ids[0]);
+  if (!selectedEntry) {
     await client.sendMessage(
       ownerJid,
-      `No matching files found. Use module + ids like: ${COMMAND_PREFIX}cources download M2.3 1,2,3`,
+      `No file found for id ${ids[0]}. Run ${COMMAND_PREFIX}cources to refresh ids.`,
     );
     return;
   }
 
   await cleanupCourseDownloadDir();
   await fs.mkdir(COURSE_DOWNLOAD_DIR, { recursive: true });
-  await client.sendMessage(ownerJid, `Matched ${selectedEntries.length} file(s) for: "${targetQuery}"`);
+  await client.sendMessage(ownerJid, `Downloading ID ${selectedEntry.id}: ${selectedEntry.name}`);
 
-  let successCount = 0;
   const failures = [];
-  for (let i = 0; i < selectedEntries.length; i += 1) {
-    const entry = selectedEntries[i];
-    try {
-      const downloaded = await downloadCourseFile(entry.url, i, selectedEntries.length, result.authCookieHeader);
-      const media = MessageMedia.fromFilePath(downloaded.outputPath);
-      await client.sendMessage(
-        ownerJid,
-        media,
-        {
-          caption: `${entry.module} | ${entry.professor}\n${entry.name}`,
-        },
-      );
-      await fs.unlink(downloaded.outputPath).catch(() => {});
-      successCount += 1;
-      await client.sendMessage(
-        ownerJid,
-        `Sent ${successCount}/${selectedEntries.length}: ${downloaded.fileName} (${downloaded.bytes} bytes)`,
-      );
-    } catch (error) {
-      failures.push(`${i + 1}. ${entry.url} -> ${getErrorText(error)}`);
-    }
+  try {
+    const downloaded = await downloadCourseFile(selectedEntry.url, 0, 1, result.authCookieHeader);
+    const media = MessageMedia.fromFilePath(downloaded.outputPath);
+    await client.sendMessage(
+      ownerJid,
+      media,
+      {
+        caption: `${selectedEntry.module} | ${selectedEntry.professor}\n${selectedEntry.name}\nID: ${selectedEntry.id}`,
+      },
+    );
+    await fs.unlink(downloaded.outputPath).catch(() => {});
+    await client.sendMessage(ownerJid, `Sent ID ${selectedEntry.id}: ${downloaded.fileName} (${downloaded.bytes} bytes)`);
+  } catch (error) {
+    failures.push(`ID ${selectedEntry.id}. ${selectedEntry.url} -> ${getErrorText(error)}`);
   }
   await cleanupCourseDownloadDir();
 
   const summary = [
     "_Cources Send Summary_",
-    `Module: ${selection.moduleCode || "(any)"}`,
-    `IDs: ${selection.ids.length ? selection.ids.join(", ") : "(any)"}`,
-    `Sent: ${successCount}/${selectedEntries.length}`,
+    `ID: ${selectedEntry.id}`,
+    `Sent: ${failures.length ? "0/1" : "1/1"}`,
     `Failed: ${failures.length}`,
     "Server files cleaned after send.",
   ];
@@ -1467,7 +1444,7 @@ function getHelpText() {
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
     `${COMMAND_PREFIX}cources (list, owner DM only)`,
-    `${COMMAND_PREFIX}cources download M2.3 1,2,3 (send target files, then delete from server)`,
+    `${COMMAND_PREFIX}cources download <id> (send one file by id, then delete from server)`,
     `${COMMAND_PREFIX}resetstore`,
   ].join("\n");
 }
