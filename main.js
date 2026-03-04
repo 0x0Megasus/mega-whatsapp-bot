@@ -29,6 +29,8 @@ let botReady = false;
 let latestQrText = null;
 const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOUT_MS || 180000);
 const DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS = Number(process.env.COURCES_DOWNLOAD_TIMEOUT_MS || 120000);
+const WWEBJS_INIT_MAX_RETRIES = Number(process.env.WWEBJS_INIT_MAX_RETRIES || 8);
+const WWEBJS_INIT_RETRY_DELAY_MS = Number(process.env.WWEBJS_INIT_RETRY_DELAY_MS || 5000);
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -299,6 +301,22 @@ function getErrorText(error) {
   } catch {
     return String(error);
   }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableInitializeError(error) {
+  const text = getErrorText(error).toLowerCase();
+  return (
+    text.includes("execution context was destroyed") ||
+    text.includes("runtime.callfunctionon") ||
+    text.includes("target closed") ||
+    text.includes("session closed") ||
+    text.includes("navigation") ||
+    text.includes("protocol error")
+  );
 }
 
 function normalizeText(value = "") {
@@ -2119,52 +2137,76 @@ async function start() {
   }
   const localAuthClientId = process.env.LOCAL_AUTH_CLIENT_ID || "default";
   await fs.mkdir(localAuthPath, { recursive: true });
-  await cleanupChromiumProfileLocks(localAuthPath, localAuthClientId);
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: localAuthClientId,
-      dataPath: localAuthPath,
-    }),
-    puppeteer: {
-      headless: true,
-      executablePath: puppeteer.executablePath(),
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    },
-  });
+  let attempts = 0;
+  const maxRetries = Number.isFinite(WWEBJS_INIT_MAX_RETRIES) ? WWEBJS_INIT_MAX_RETRIES : 8;
+  while (attempts < maxRetries) {
+    attempts += 1;
+    await cleanupChromiumProfileLocks(localAuthPath, localAuthClientId);
+    botReady = false;
+    latestQrText = null;
 
-  client.on("qr", (qr) => {
-    latestQrText = qr;
-    qrcode.generate(qr, { small: true });
-    console.log(`Open this QR image URL: ${getQrImageUrl(qr)}`);
-    console.log("Or open /qr endpoint on your Railway public URL.");
-    console.log("Scan the QR code above in WhatsApp.");
-  });
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: localAuthClientId,
+        dataPath: localAuthPath,
+      }),
+      puppeteer: {
+        headless: true,
+        executablePath: puppeteer.executablePath(),
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      },
+    });
 
-  client.on("ready", async () => {
-    console.log("Bot is ready.");
-    botReady = true;
-    await markCurrentMembersAsWelcomed(client);
-  });
+    client.on("qr", (qr) => {
+      latestQrText = qr;
+      qrcode.generate(qr, { small: true });
+      console.log(`Open this QR image URL: ${getQrImageUrl(qr)}`);
+      console.log("Or open /qr endpoint on your Railway public URL.");
+      console.log("Scan the QR code above in WhatsApp.");
+    });
 
-  client.on("message_create", async (message) => {
+    client.on("ready", async () => {
+      console.log("Bot is ready.");
+      botReady = true;
+      await markCurrentMembersAsWelcomed(client);
+    });
+
+    client.on("message_create", async (message) => {
+      try {
+        cacheAlbumMediaMessage(message);
+        await handleCommand(client, message);
+      } catch (error) {
+        console.error("Command error:", error);
+      }
+    });
+
+    client.on("group_join", async (notification) => {
+      try {
+        await handleGroupJoin(client, notification);
+      } catch (error) {
+        console.error("group_join error:", error.message);
+      }
+    });
+
     try {
-      cacheAlbumMediaMessage(message);
-      await handleCommand(client, message);
+      await client.initialize();
+      return;
     } catch (error) {
-      console.error("Command error:", error);
+      const retryable = isRetryableInitializeError(error);
+      const isLast = attempts >= maxRetries;
+      console.error(`Initialize failed (attempt ${attempts}/${maxRetries}): ${getErrorText(error)}`);
+      try {
+        await client.destroy();
+      } catch {}
+      if (!retryable || isLast) {
+        throw error;
+      }
+      const waitMs = WWEBJS_INIT_RETRY_DELAY_MS * attempts;
+      console.log(`Retrying initialize in ${waitMs}ms...`);
+      await delay(waitMs);
     }
-  });
-
-  client.on("group_join", async (notification) => {
-    try {
-      await handleGroupJoin(client, notification);
-    } catch (error) {
-      console.error("group_join error:", error.message);
-    }
-  });
-
-  await client.initialize();
+  }
 }
 
 start().catch((error) => {
