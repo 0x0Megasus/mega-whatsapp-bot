@@ -462,6 +462,21 @@ function extractModuleAndProfessor(courseName = "") {
   return { module, professor };
 }
 
+function isIgnoredCourseLink(link = {}) {
+  const name = normalizeText(link.name || "").toLowerCase();
+  const url = String(link.url || "").toLowerCase();
+  if (!url) return true;
+
+  // Ignore announcement/forum resources; they usually do not provide downloadable files.
+  if (name.includes("announcement") || name.includes("annonce") || name.includes("annonces")) return true;
+  if (url.includes("/mod/forum/")) return true;
+  if (url.includes("newsforum")) return true;
+  if (url.includes("annonces")) return true;
+  if (url.includes("announcements")) return true;
+
+  return false;
+}
+
 async function listDocumentsForM2M4Courses(courses, cookieHeader, userAgent, baseUrl) {
   const targetCourses = courses.filter((course) => looksLikeM2OrM4Course(course.name));
   const groupedDocs = new Map();
@@ -488,7 +503,9 @@ async function listDocumentsForM2M4Courses(courses, cookieHeader, userAgent, bas
           const instanceName = normalizeText($(element).find("span.instancename").first().text());
           const fallbackName = normalizeText($(element).text());
           const fileName = instanceName || fallbackName || "resource";
-          links.push({ url: absoluteHref, name: fileName });
+          const link = { url: absoluteHref, name: fileName };
+          if (isIgnoredCourseLink(link)) return;
+          links.push(link);
         });
 
         return { groupInfo, links };
@@ -600,7 +617,7 @@ async function fetchUcaCourseLinks() {
   }
 
   const groups = await listDocumentsForM2M4Courses(courses, dashboardStep.cookieHeader, userAgent, baseUrl);
-  const lines = ["*Cources Result* 📚", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
+  const lines = ["_Cources Result_", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
 
   if (!groups.length) {
     lines.push("No file URLs found for M2/M4 courses.");
@@ -610,14 +627,14 @@ async function fetchUcaCourseLinks() {
   let globalId = 1;
   const entries = [];
   for (const group of groups) {
-    lines.push("━━━━━━━━━━━━━━━━━━━━");
-    lines.push(`👨‍🏫 ${group.professor}`);
-    lines.push(`📘 ${group.module}`);
-    lines.push("━━━━━━━━━━━━━━━━━━━━");
+    lines.push("-----------");
+    lines.push(`${group.professor}`);
+    lines.push(`${group.module}`);
+    lines.push("-----------");
     for (let i = 0; i < group.links.length; i += 1) {
       const link = group.links[i];
       lines.push(`${globalId}. ${link.name}`);
-      lines.push(`🔗 ${link.url}`);
+      lines.push(`${link.url}`);
       entries.push({
         id: globalId,
         module: group.module,
@@ -782,9 +799,10 @@ async function handleCourcesCommand(client, message, args) {
   );
 
   const result = await fetchUcaCourseLinks();
-  await sendTextInChunks(client, ownerJid, result.text);
-
-  if (!shouldDownload) return;
+  if (!shouldDownload) {
+    await sendTextInChunks(client, ownerJid, result.text);
+    return;
+  }
   if (!targetQuery) {
     await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download M2.3 1,2,3`);
     return;
@@ -819,7 +837,7 @@ async function handleCourcesCommand(client, message, args) {
         ownerJid,
         media,
         {
-          caption: `📎 ${entry.module} | ${entry.professor}\n${entry.name}`,
+          caption: `${entry.module} | ${entry.professor}\n${entry.name}`,
         },
       );
       await fs.unlink(downloaded.outputPath).catch(() => {});
@@ -835,12 +853,12 @@ async function handleCourcesCommand(client, message, args) {
   await cleanupCourseDownloadDir();
 
   const summary = [
-    "*Cources Send Summary*",
+    "_Cources Send Summary_",
     `Module: ${selection.moduleCode || "(any)"}`,
     `IDs: ${selection.ids.length ? selection.ids.join(", ") : "(any)"}`,
     `Sent: ${successCount}/${selectedEntries.length}`,
     `Failed: ${failures.length}`,
-    "Server files cleaned after send ✅",
+    "Server files cleaned after send.",
   ];
   if (!result.authCookieHeader) {
     summary.push("Warning: missing auth cookies; protected files may fail.");
