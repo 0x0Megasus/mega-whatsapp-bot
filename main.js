@@ -628,12 +628,12 @@ async function fetchUcaCourseLinks() {
   const entries = [];
   for (const group of groups) {
     lines.push("────────────────────────────");
-    lines.push(`${group.professor}`);
+    lines.push(`*${group.professor}*`);
     lines.push(`${group.module}`);
     lines.push("────────────────────────────");
     for (let i = 0; i < group.links.length; i += 1) {
       const link = group.links[i];
-      lines.push(`ID ${globalId}: ${link.name}`);
+      lines.push(`ID ${globalId}: _${link.name}_`);
       lines.push(`${link.url}`);
       entries.push({
         id: globalId,
