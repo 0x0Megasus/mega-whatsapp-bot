@@ -454,6 +454,16 @@ function looksLikeM2OrM4Course(courseName = "") {
   return /\bM(?:2|4)(?:\.\d+)?(?!\d)/i.test(courseName);
 }
 
+function isValidSemester(value = "") {
+  return value === "2" || value === "4";
+}
+
+function courseMatchesSemester(courseName = "", semester = "") {
+  if (!isValidSemester(semester)) return false;
+  const pattern = new RegExp(`\\bM${semester}(?:\\.\\d+)?(?!\\d)`, "i");
+  return pattern.test(courseName);
+}
+
 function extractModuleAndProfessor(courseName = "") {
   const moduleMatch = courseName.match(/\bM(?:2|4)(?:\.\d+)?(?!\d)/i);
   const profMatch = courseName.match(/\bPr\.?\s*([^\[\]|]+)/i);
@@ -549,7 +559,7 @@ function parseLoginError(html) {
   return "";
 }
 
-async function fetchUcaCourseLinks() {
+async function fetchUcaCourseLinks(semester) {
   const cfg = getUcaConfig();
   const userAgent = "whatsappMegaBot-cources/1.0";
   const baseUrl = `${new URL(cfg.api).protocol}//${new URL(cfg.api).host}`;
@@ -617,16 +627,28 @@ async function fetchUcaCourseLinks() {
   }
 
   const groups = await listDocumentsForM2M4Courses(courses, dashboardStep.cookieHeader, userAgent, baseUrl);
-  const lines = ["_Cources Result_", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
+  const filteredGroups = groups
+    .map((group) => ({
+      ...group,
+      links: group.links.filter((link) => courseMatchesSemester(`${group.module} ${link.name}`, semester)),
+    }))
+    .filter((group) => group.links.length > 0 && courseMatchesSemester(group.module, semester));
+  const lines = [
+    "_Cources Result_",
+    `Semester: ${semester}`,
+    `Courses found: ${courses.length}`,
+    `Groups with files: ${filteredGroups.length}`,
+    "",
+  ];
 
-  if (!groups.length) {
-    lines.push("No file URLs found for M2/M4 courses.");
+  if (!filteredGroups.length) {
+    lines.push(`No file URLs found for M${semester} courses.`);
     return { text: lines.join("\n"), entries: [], authCookieHeader: dashboardStep.cookieHeader || "" };
   }
 
   let globalId = 1;
   const entries = [];
-  for (const group of groups) {
+  for (const group of filteredGroups) {
     lines.push("────────────────────────────");
     lines.push(`*${group.professor}*`);
     lines.push(`${group.module}`);
@@ -647,7 +669,7 @@ async function fetchUcaCourseLinks() {
     lines.push("");
   }
 
-  lines.push(`Tip: ${COMMAND_PREFIX}cources download <id>`);
+  lines.push(`Tip: ${COMMAND_PREFIX}cources download ${semester} <id>`);
   return { text: lines.join("\n"), entries, authCookieHeader: dashboardStep.cookieHeader || "" };
 }
 
@@ -762,7 +784,8 @@ async function handleCourcesCommand(client, message, args) {
   const ownerJid = getSenderId(message);
   const sub = (args[0] || "").toLowerCase();
   const shouldDownload = sub === "download" || sub === "dl";
-  const targetQuery = shouldDownload ? args.slice(1).join(" ").trim() : "";
+  const semester = shouldDownload ? String(args[1] || "").trim() : String(args[0] || "").trim();
+  const targetQuery = shouldDownload ? args.slice(2).join(" ").trim() : "";
 
   if (!isPrivateMessage(message)) {
     await message.reply("Processing .cources. I will send the result in your DM only.");
@@ -775,13 +798,18 @@ async function handleCourcesCommand(client, message, args) {
       : "Fetching courses, please wait...",
   );
 
-  const result = await fetchUcaCourseLinks();
+  if (!isValidSemester(semester)) {
+    await client.sendMessage(ownerJid, "Invalid semester number. Use 2 or 4.");
+    return;
+  }
+
+  const result = await fetchUcaCourseLinks(semester);
   if (!shouldDownload) {
     await sendTextInChunks(client, ownerJid, result.text);
     return;
   }
   if (!targetQuery) {
-    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download <id>`);
+    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
     return;
   }
   if (!result.entries.length) {
@@ -791,7 +819,7 @@ async function handleCourcesCommand(client, message, args) {
 
   const ids = parseDownloadIds(targetQuery);
   if (!ids.length) {
-    await client.sendMessage(ownerJid, `Invalid id. Use: ${COMMAND_PREFIX}cources download <id>`);
+    await client.sendMessage(ownerJid, `Invalid id. Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
     return;
   }
   if (ids.length > 1) {
@@ -810,9 +838,7 @@ async function handleCourcesCommand(client, message, args) {
 
   await cleanupCourseDownloadDir();
   await fs.mkdir(COURSE_DOWNLOAD_DIR, { recursive: true });
-  await client.sendMessage(ownerJid, `Downloading ID ${selectedEntry.id}: ${selectedEntry.name}`);
-
-  const failures = [];
+  await client.sendMessage(ownerJid, "Please wait...");
   try {
     const downloaded = await downloadCourseFile(selectedEntry.url, 0, 1, result.authCookieHeader);
     const media = MessageMedia.fromFilePath(downloaded.outputPath);
@@ -824,30 +850,11 @@ async function handleCourcesCommand(client, message, args) {
       },
     );
     await fs.unlink(downloaded.outputPath).catch(() => {});
-    await client.sendMessage(ownerJid, `Sent ID ${selectedEntry.id}: ${downloaded.fileName} (${downloaded.bytes} bytes)`);
   } catch (error) {
-    failures.push(`ID ${selectedEntry.id}. ${selectedEntry.url} -> ${getErrorText(error)}`);
+    await client.sendMessage(ownerJid, `Failed to send ID ${selectedEntry.id}: ${getErrorText(error)}`);
+  } finally {
+    await cleanupCourseDownloadDir();
   }
-  await cleanupCourseDownloadDir();
-
-  const summary = [
-    "_Cources Send Summary_",
-    `ID: ${selectedEntry.id}`,
-    `Sent: ${failures.length ? "0/1" : "1/1"}`,
-    `Failed: ${failures.length}`,
-    "Server files cleaned after send.",
-  ];
-  if (!result.authCookieHeader) {
-    summary.push("Warning: missing auth cookies; protected files may fail.");
-  }
-  if (failures.length) {
-    summary.push("");
-    summary.push("Failures:");
-    summary.push(...failures.slice(0, 20));
-    if (failures.length > 20) summary.push(`... and ${failures.length - 20} more`);
-  }
-
-  await sendTextInChunks(client, ownerJid, summary.join("\n"));
 }
 
 function configureFfmpegPath() {
@@ -1443,8 +1450,8 @@ function getHelpText() {
     `${COMMAND_PREFIX}kick @user (group only)`,
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
-    `${COMMAND_PREFIX}cources (list, owner DM only)`,
-    `${COMMAND_PREFIX}cources download <id> (send one file by id, then delete from server)`,
+    `${COMMAND_PREFIX}cources <2|4> (list, owner DM only)`,
+    `${COMMAND_PREFIX}cources download <2|4> <id> (send one file by id, then delete from server)`,
     `${COMMAND_PREFIX}resetstore`,
   ].join("\n");
 }
