@@ -582,25 +582,38 @@ async function fetchUcaCourseLinks() {
   }
 
   const groups = await listDocumentsForM2M4Courses(courses, dashboardStep.cookieHeader, userAgent, baseUrl);
-  const urls = [];
-  const lines = ["*Cources Result*", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
+  const lines = ["*Cources Result* 📚", `Courses found: ${courses.length}`, `Groups with files: ${groups.length}`, ""];
 
   if (!groups.length) {
     lines.push("No file URLs found for M2/M4 courses.");
-    return { text: lines.join("\n"), urls, moodleSession: cfg.moodleSession };
+    return { text: lines.join("\n"), entries: [], authCookieHeader: dashboardStep.cookieHeader || "" };
   }
 
+  let globalId = 1;
+  const entries = [];
   for (const group of groups) {
-    lines.push(`${group.module} | ${group.professor}`);
+    lines.push("━━━━━━━━━━━━━━━━━━━━");
+    lines.push(`👨‍🏫 ${group.professor}`);
+    lines.push(`📘 ${group.module}`);
+    lines.push("━━━━━━━━━━━━━━━━━━━━");
     for (let i = 0; i < group.links.length; i += 1) {
       const link = group.links[i];
-      lines.push(`${i + 1}. ${link.name}: ${link.url}`);
-      urls.push(link.url);
+      lines.push(`${globalId}. ${link.name}`);
+      lines.push(`🔗 ${link.url}`);
+      entries.push({
+        id: globalId,
+        module: group.module,
+        professor: group.professor,
+        name: link.name,
+        url: link.url,
+      });
+      globalId += 1;
     }
     lines.push("");
   }
 
-  return { text: lines.join("\n"), urls, moodleSession: cfg.moodleSession };
+  lines.push(`Tip: ${COMMAND_PREFIX}cources download M2.3 1,2,3`);
+  return { text: lines.join("\n"), entries, authCookieHeader: dashboardStep.cookieHeader || "" };
 }
 
 function sanitizeFileName(name = "file") {
@@ -636,9 +649,9 @@ function fileNameFromContentDisposition(header = "") {
   return "";
 }
 
-async function downloadCourseFile(url, index, total, moodleSession) {
+async function downloadCourseFile(url, index, total, authCookieHeader) {
   const headers = {};
-  if (moodleSession) headers.Cookie = `MoodleSession=${moodleSession}`;
+  if (authCookieHeader) headers.Cookie = authCookieHeader;
 
   const response = await fetch(url, {
     method: "GET",
@@ -659,6 +672,41 @@ async function downloadCourseFile(url, index, total, moodleSession) {
 
   await fs.writeFile(outputPath, data);
   return { fileName: finalName, outputPath, bytes: data.length };
+}
+
+function normalizeQuery(value = "") {
+  return String(value).toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function parseDownloadSelection(raw = "") {
+  const input = String(raw || "").trim();
+  const moduleMatch = input.match(/\b(M\d+(?:\.\d+)?)\b/i);
+  const moduleCode = moduleMatch ? moduleMatch[1].toUpperCase() : "";
+  const numberMatches = [...input.matchAll(/#?(\d+)/g)]
+    .map((m) => Number(m[1]))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  const ids = [...new Set(numberMatches)];
+  return { moduleCode, ids };
+}
+
+function selectCourcesTargets(entries, selection) {
+  const hasModule = Boolean(selection?.moduleCode);
+  const hasIds = Array.isArray(selection?.ids) && selection.ids.length > 0;
+  if (!hasModule && !hasIds) return [];
+
+  let filtered = entries;
+  if (hasModule) {
+    filtered = filtered.filter((entry) => normalizeQuery(entry.module) === normalizeQuery(selection.moduleCode));
+  }
+  if (hasIds) {
+    const wanted = new Set(selection.ids);
+    filtered = filtered.filter((entry) => wanted.has(entry.id));
+  }
+  return filtered;
+}
+
+async function cleanupCourseDownloadDir() {
+  await fs.rm(COURSE_DOWNLOAD_DIR, { recursive: true, force: true });
 }
 
 function toMessageChunks(text = "", maxLen = 3500) {
@@ -702,6 +750,7 @@ async function handleCourcesCommand(client, message, args) {
   const ownerJid = getSenderId(message);
   const sub = (args[0] || "").toLowerCase();
   const shouldDownload = sub === "download" || sub === "dl";
+  const targetQuery = shouldDownload ? args.slice(1).join(" ").trim() : "";
 
   if (!isPrivateMessage(message)) {
     await message.reply("Processing .cources. I will send the result in your DM only.");
@@ -718,36 +767,65 @@ async function handleCourcesCommand(client, message, args) {
   await sendTextInChunks(client, ownerJid, result.text);
 
   if (!shouldDownload) return;
-  if (!result.urls.length) {
+  if (!targetQuery) {
+    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download M2.3 1,2,3`);
+    return;
+  }
+  if (!result.entries.length) {
     await client.sendMessage(ownerJid, "No URLs found, nothing to download.");
     return;
   }
 
+  const selection = parseDownloadSelection(targetQuery);
+  const selectedEntries = selectCourcesTargets(result.entries, selection);
+  if (!selectedEntries.length) {
+    await client.sendMessage(
+      ownerJid,
+      `No matching files found. Use module + ids like: ${COMMAND_PREFIX}cources download M2.3 1,2,3`,
+    );
+    return;
+  }
+
+  await cleanupCourseDownloadDir();
   await fs.mkdir(COURSE_DOWNLOAD_DIR, { recursive: true });
+  await client.sendMessage(ownerJid, `Matched ${selectedEntries.length} file(s) for: "${targetQuery}"`);
+
   let successCount = 0;
   const failures = [];
-  for (let i = 0; i < result.urls.length; i += 1) {
-    const targetUrl = result.urls[i];
+  for (let i = 0; i < selectedEntries.length; i += 1) {
+    const entry = selectedEntries[i];
     try {
-      const downloaded = await downloadCourseFile(targetUrl, i, result.urls.length, result.moodleSession);
+      const downloaded = await downloadCourseFile(entry.url, i, selectedEntries.length, result.authCookieHeader);
+      const media = MessageMedia.fromFilePath(downloaded.outputPath);
+      await client.sendMessage(
+        ownerJid,
+        media,
+        {
+          caption: `📎 ${entry.module} | ${entry.professor}\n${entry.name}`,
+        },
+      );
+      await fs.unlink(downloaded.outputPath).catch(() => {});
       successCount += 1;
       await client.sendMessage(
         ownerJid,
-        `Downloaded ${successCount}/${result.urls.length}: ${downloaded.fileName} (${downloaded.bytes} bytes)`,
+        `Sent ${successCount}/${selectedEntries.length}: ${downloaded.fileName} (${downloaded.bytes} bytes)`,
       );
     } catch (error) {
-      failures.push(`${i + 1}. ${targetUrl} -> ${getErrorText(error)}`);
+      failures.push(`${i + 1}. ${entry.url} -> ${getErrorText(error)}`);
     }
   }
+  await cleanupCourseDownloadDir();
 
   const summary = [
-    "*Cources Download Summary*",
-    `Saved in: ${COURSE_DOWNLOAD_DIR}`,
-    `Success: ${successCount}/${result.urls.length}`,
+    "*Cources Send Summary*",
+    `Module: ${selection.moduleCode || "(any)"}`,
+    `IDs: ${selection.ids.length ? selection.ids.join(", ") : "(any)"}`,
+    `Sent: ${successCount}/${selectedEntries.length}`,
     `Failed: ${failures.length}`,
+    "Server files cleaned after send ✅",
   ];
-  if (!result.moodleSession) {
-    summary.push("Warning: no moodlesession configured. Set UCA_MOODLESESSION for protected files.");
+  if (!result.authCookieHeader) {
+    summary.push("Warning: missing auth cookies; protected files may fail.");
   }
   if (failures.length) {
     summary.push("");
@@ -1352,7 +1430,8 @@ function getHelpText() {
     `${COMMAND_PREFIX}kick @user (group only)`,
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
-    `${COMMAND_PREFIX}cources [download] (result sent to owner DM only)`,
+    `${COMMAND_PREFIX}cources (list, owner DM only)`,
+    `${COMMAND_PREFIX}cources download M2.3 1,2,3 (send target files, then delete from server)`,
     `${COMMAND_PREFIX}resetstore`,
   ].join("\n");
 }
