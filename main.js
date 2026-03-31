@@ -2110,7 +2110,7 @@ async function handleGroupJoin(client, notification) {
   for (const jid of newMembers) {
     const emoji = pickWelcomeEmoji(groupId);
     const name = await formatUser(client, jid);
-    const base = `Welcome ${name} to this fuckin group, & Ramadan Mubarak.`;
+    const base = `Welcome ${name} to this group.`;
     await notification.reply(emoji ? `${base} ${emoji}` : base);
   }
   await saveStore();
