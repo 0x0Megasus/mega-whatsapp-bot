@@ -781,56 +781,52 @@ async function handleCourcesCommand(client, message, args) {
     return;
   }
 
-  const ownerJid = getSenderId(message);
+  const targetJid = message.from;
   const sub = (args[0] || "").toLowerCase();
   const shouldDownload = sub === "download" || sub === "dl";
   const semester = shouldDownload ? String(args[1] || "").trim() : String(args[0] || "").trim();
   const targetQuery = shouldDownload ? args.slice(2).join(" ").trim() : "";
 
-  if (!isPrivateMessage(message)) {
-    await message.reply("Processing .cources. I will send the result in your DM only.");
-  }
-
   await client.sendMessage(
-    ownerJid,
+    targetJid,
     shouldDownload
       ? "Fetching courses and downloading linked files, please wait..."
       : "Fetching courses, please wait...",
   );
 
   if (!isValidSemester(semester)) {
-    await client.sendMessage(ownerJid, "Invalid semester number. Use 2 or 4.");
+    await client.sendMessage(targetJid, "Invalid semester number. Use 2 or 4.");
     return;
   }
 
   const result = await fetchUcaCourseLinks(semester);
   if (!shouldDownload) {
-    await sendTextInChunks(client, ownerJid, result.text);
+    await sendTextInChunks(client, targetJid, result.text);
     return;
   }
   if (!targetQuery) {
-    await client.sendMessage(ownerJid, `Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
+    await client.sendMessage(targetJid, `Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
     return;
   }
   if (!result.entries.length) {
-    await client.sendMessage(ownerJid, "No URLs found, nothing to download.");
+    await client.sendMessage(targetJid, "No URLs found, nothing to download.");
     return;
   }
 
   const ids = parseDownloadIds(targetQuery);
   if (!ids.length) {
-    await client.sendMessage(ownerJid, `Invalid id. Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
+    await client.sendMessage(targetJid, `Invalid id. Use: ${COMMAND_PREFIX}cources download ${semester} <id>`);
     return;
   }
   if (ids.length > 1) {
-    await client.sendMessage(ownerJid, "Use one id at a time to avoid conflicts.");
+    await client.sendMessage(targetJid, "Use one id at a time to avoid conflicts.");
     return;
   }
 
   const selectedEntry = result.entries.find((entry) => entry.id === ids[0]);
   if (!selectedEntry) {
     await client.sendMessage(
-      ownerJid,
+      targetJid,
       `No file found for id ${ids[0]}. Run ${COMMAND_PREFIX}cources to refresh ids.`,
     );
     return;
@@ -838,12 +834,12 @@ async function handleCourcesCommand(client, message, args) {
 
   await cleanupCourseDownloadDir();
   await fs.mkdir(COURSE_DOWNLOAD_DIR, { recursive: true });
-  await client.sendMessage(ownerJid, "Please wait...");
+  await client.sendMessage(targetJid, "Please wait...");
   try {
     const downloaded = await downloadCourseFile(selectedEntry.url, 0, 1, result.authCookieHeader);
     const media = MessageMedia.fromFilePath(downloaded.outputPath);
     await client.sendMessage(
-      ownerJid,
+      targetJid,
       media,
       {
         caption: `${selectedEntry.module} | ${selectedEntry.professor}\n${selectedEntry.name}\nID: ${selectedEntry.id}`,
@@ -851,7 +847,7 @@ async function handleCourcesCommand(client, message, args) {
     );
     await fs.unlink(downloaded.outputPath).catch(() => {});
   } catch (error) {
-    await client.sendMessage(ownerJid, `Failed to send ID ${selectedEntry.id}: ${getErrorText(error)}`);
+    await client.sendMessage(targetJid, `Failed to send ID ${selectedEntry.id}: ${getErrorText(error)}`);
   } finally {
     await cleanupCourseDownloadDir();
   }
@@ -1446,12 +1442,14 @@ function getHelpText() {
     `${COMMAND_PREFIX}mafia help`,
     `${COMMAND_PREFIX}flag help`,
     "",
+    "Course Commands (owner only: DM or group):",
+    `${COMMAND_PREFIX}cources <2|4>`,
+    `${COMMAND_PREFIX}cources download <2|4> <id> (send one file by id, then delete from server)`,
+    "",
     "Owner Commands:",
     `${COMMAND_PREFIX}kick @user (group only)`,
     `${COMMAND_PREFIX}close (group only)`,
     `${COMMAND_PREFIX}open (group only)`,
-    `${COMMAND_PREFIX}cources <2|4> (list, owner DM only)`,
-    `${COMMAND_PREFIX}cources download <2|4> <id> (send one file by id, then delete from server)`,
     `${COMMAND_PREFIX}resetstore`,
   ].join("\n");
 }
@@ -1983,11 +1981,7 @@ async function handleCommand(client, message) {
     try {
       await handleCourcesCommand(client, message, parts);
     } catch (error) {
-      const ownerJid = getSenderId(message);
-      await client.sendMessage(ownerJid, `Failed to run ${COMMAND_PREFIX}cources: ${getErrorText(error)}`);
-      if (!isPrivateMessage(message)) {
-        await message.reply("Failed to process .cources. Check your DM for details.");
-      }
+      await message.reply(`Failed to run ${COMMAND_PREFIX}cources: ${getErrorText(error)}`);
       console.error("Cources command error:", error);
     }
     return;
