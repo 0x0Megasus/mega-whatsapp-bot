@@ -47,6 +47,9 @@ const SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_
 const SOCIAL_DOWNLOADER_MAX_BYTES = Number(process.env.SOCIAL_DOWNLOADER_MAX_BYTES || 64 * 1024 * 1024);
 const MUSIC_SELECTION_TTL_MS = Number(process.env.MUSIC_SELECTION_TTL_MS || 10 * 60 * 1000);
 const MUSIC_DOWNLOAD_TIMEOUT_MS = Number(process.env.MUSIC_DOWNLOAD_TIMEOUT_MS || 240000);
+const MUSIC_API_MAX_ATTEMPTS = parsePositiveNumber(process.env.MUSIC_API_MAX_ATTEMPTS, 2);
+const MUSIC_API_RETRY_DELAY_MS = parsePositiveNumber(process.env.MUSIC_API_RETRY_DELAY_MS, 1500);
+const RETRYABLE_MUSIC_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -379,6 +382,12 @@ function normalizeText(value = "") {
   return String(value).replace(/\s+/g, " ").trim();
 }
 
+function parsePositiveNumber(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
 function normalizeApiBase(value = "") {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -453,6 +462,67 @@ async function parseApiJson(response) {
   } catch {
     return {};
   }
+}
+
+function isRetryableMusicStatus(statusCode = 0) {
+  return RETRYABLE_MUSIC_STATUS_CODES.has(Number(statusCode));
+}
+
+function isRetryableMusicError(error) {
+  const text = getErrorText(error).toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("timeout") ||
+    text.includes("timed out") ||
+    text.includes("fetch failed") ||
+    text.includes("socket") ||
+    text.includes("network") ||
+    text.includes("econnreset") ||
+    text.includes("econnrefused") ||
+    text.includes("enotfound") ||
+    text.includes("eai_again") ||
+    text.includes("503") ||
+    text.includes("502")
+  );
+}
+
+async function postMusicApiJson(pathname, body, operationLabel) {
+  const apiUrl = getMusicApiUrl(pathname);
+  let attempt = 0;
+  let lastError = null;
+  while (attempt < MUSIC_API_MAX_ATTEMPTS) {
+    attempt += 1;
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+      });
+      const payload = await parseApiJson(response);
+      if (response.ok) return { payload, apiUrl };
+
+      const statusError = new Error(
+        payload?.error || payload?.message || `${operationLabel} failed (HTTP ${response.status}) at ${apiUrl}`,
+      );
+      if (attempt < MUSIC_API_MAX_ATTEMPTS && isRetryableMusicStatus(response.status)) {
+        await delay(MUSIC_API_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      throw statusError;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MUSIC_API_MAX_ATTEMPTS && isRetryableMusicError(error)) {
+        await delay(MUSIC_API_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError || new Error(`${operationLabel} failed at ${apiUrl}`);
 }
 
 function shouldTreatMusicProgressErrorAsTransient(errorText = "") {
@@ -623,19 +693,7 @@ function normalizeMusicSuggestion(item, index) {
 }
 
 async function searchMusicSuggestions(query) {
-  const apiUrl = getMusicApiUrl(MUSIC_SEARCH_PATH);
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query }),
-    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
-  });
-  const payload = await parseApiJson(response);
-  if (!response.ok) {
-    throw new Error(payload?.error || payload?.message || `Music search failed (HTTP ${response.status}) at ${apiUrl}`);
-  }
+  const { payload, apiUrl } = await postMusicApiJson(MUSIC_SEARCH_PATH, { query }, "Music search");
 
   const sessionId = String(payload?.sessionId || "").trim();
   if (!sessionId) throw new Error(`Music search returned no sessionId from ${apiUrl}`);
@@ -677,19 +735,11 @@ function resolveMusicSelectionFromInput(pending, rawInput = "") {
 }
 
 async function createMusicDownloadJob(sessionId, optionId) {
-  const apiUrl = getMusicApiUrl(MUSIC_DOWNLOAD_PATH);
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ sessionId, optionId }),
-    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
-  });
-  const payload = await parseApiJson(response);
-  if (!response.ok) {
-    throw new Error(payload?.error || payload?.message || `Music download failed (HTTP ${response.status}) at ${apiUrl}`);
-  }
+  const { payload, apiUrl } = await postMusicApiJson(
+    MUSIC_DOWNLOAD_PATH,
+    { sessionId, optionId },
+    "Music download",
+  );
 
   const id = String(payload?.id || "").trim();
   if (!id) throw new Error(`Music download returned no file id from ${apiUrl}`);
