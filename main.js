@@ -25,6 +25,7 @@ const ADMIN_JIDS = new Set(["212704588420@c.us"]);
 const ADMIN_PHONE_NUMBERS = new Set(["212704588420"]);
 let ffmpegBinaryPath = null;
 const albumMediaCache = new Map();
+const pendingMusicSelections = new Map();
 let botReady = false;
 let latestQrText = null;
 const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOUT_MS || 180000);
@@ -42,6 +43,8 @@ const SOCIAL_DOWNLOADER_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_TIMEOU
 const SOCIAL_DOWNLOADER_POLL_INTERVAL_MS = Number(process.env.SOCIAL_DOWNLOADER_POLL_INTERVAL_MS || 1200);
 const SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS || 180000);
 const SOCIAL_DOWNLOADER_MAX_BYTES = Number(process.env.SOCIAL_DOWNLOADER_MAX_BYTES || 64 * 1024 * 1024);
+const MUSIC_SELECTION_TTL_MS = Number(process.env.MUSIC_SELECTION_TTL_MS || 10 * 60 * 1000);
+const MUSIC_DOWNLOAD_TIMEOUT_MS = Number(process.env.MUSIC_DOWNLOAD_TIMEOUT_MS || 240000);
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -411,6 +414,16 @@ async function parseApiJson(response) {
   }
 }
 
+function shouldTreatMusicProgressErrorAsTransient(errorText = "") {
+  const normalized = String(errorText || "").toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("setup buttons") ||
+    normalized.includes("bot_username") ||
+    normalized.includes("music search bot")
+  );
+}
+
 function formatBytes(bytes = 0) {
   const value = Number(bytes) || 0;
   if (value < 1024) return `${value} B`;
@@ -448,9 +461,11 @@ async function createSocialDownloadJob(url) {
   return id;
 }
 
-async function waitForSocialDownloadJob(jobId) {
+async function waitForSocialDownloadJob(jobId, options = {}) {
+  const { timeoutMessage, shouldIgnoreProgressError, timeoutMs } = options;
+  const maxWaitMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : SOCIAL_DOWNLOADER_TIMEOUT_MS;
   const startedAt = Date.now();
-  while (Date.now() - startedAt < SOCIAL_DOWNLOADER_TIMEOUT_MS) {
+  while (Date.now() - startedAt < maxWaitMs) {
     const response = await fetch(getSocialDownloaderApiUrl(`/api/progress/${encodeURIComponent(jobId)}`), {
       method: "GET",
       signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
@@ -460,7 +475,11 @@ async function waitForSocialDownloadJob(jobId) {
       const progress = Number(payload?.progress);
       if (Number.isFinite(progress)) {
         if (progress === -1) {
-          throw new Error(payload?.error || "Download failed");
+          const progressError = String(payload?.error || "Download failed");
+          const canIgnore = typeof shouldIgnoreProgressError === "function" && shouldIgnoreProgressError(progressError);
+          if (!canIgnore) {
+            throw new Error(progressError);
+          }
         }
         if (progress >= 100) {
           return;
@@ -470,7 +489,7 @@ async function waitForSocialDownloadJob(jobId) {
     await delay(SOCIAL_DOWNLOADER_POLL_INTERVAL_MS);
   }
 
-  throw new Error("Download timed out. Try again with another link.");
+  throw new Error(timeoutMessage || "Download timed out. Try again with another link.");
 }
 
 async function fetchSocialDownloadFile(jobId) {
@@ -493,6 +512,212 @@ async function fetchSocialDownloadFile(jobId) {
   const fileName = fileNameFromContentDisposition(disposition) || fallbackName;
   const buffer = Buffer.from(await response.arrayBuffer());
   return { mimeType, fileName, buffer, fileUrl };
+}
+
+async function sendDownloadedApiFile(client, jid, jobId, caption, options = {}) {
+  const { forceDocument = false } = options;
+  const mediaFile = await fetchSocialDownloadFile(jobId);
+
+  if (mediaFile.buffer.length > SOCIAL_DOWNLOADER_MAX_BYTES) {
+    await client.sendMessage(
+      jid,
+      `The file is ${formatBytes(mediaFile.buffer.length)}, above current bot media limit (${formatBytes(
+        SOCIAL_DOWNLOADER_MAX_BYTES,
+      )}). Download it directly:\n${mediaFile.fileUrl}`,
+    );
+    return false;
+  }
+
+  const media = new MessageMedia(mediaFile.mimeType, mediaFile.buffer.toString("base64"), mediaFile.fileName);
+  const baseOptions = caption ? { caption } : {};
+
+  try {
+    await client.sendMessage(jid, media, forceDocument ? { ...baseOptions, sendMediaAsDocument: true } : baseOptions);
+  } catch {
+    await client.sendMessage(jid, media, {
+      ...baseOptions,
+      sendMediaAsDocument: true,
+    });
+  }
+
+  return true;
+}
+
+function getMusicSelectionKey(message) {
+  return `${message.from}::${getSenderId(message)}`;
+}
+
+function cleanupPendingMusicSelections() {
+  const now = Date.now();
+  for (const [key, entry] of pendingMusicSelections.entries()) {
+    if (!entry?.createdAt || now - entry.createdAt > MUSIC_SELECTION_TTL_MS) {
+      pendingMusicSelections.delete(key);
+    }
+  }
+}
+
+function setPendingMusicSelection(message, payload) {
+  cleanupPendingMusicSelections();
+  pendingMusicSelections.set(getMusicSelectionKey(message), {
+    ...payload,
+    createdAt: Date.now(),
+    inProgress: false,
+  });
+}
+
+function getPendingMusicSelection(message) {
+  cleanupPendingMusicSelections();
+  return pendingMusicSelections.get(getMusicSelectionKey(message)) || null;
+}
+
+function clearPendingMusicSelection(message) {
+  pendingMusicSelections.delete(getMusicSelectionKey(message));
+}
+
+function normalizeMusicSuggestion(item, index) {
+  const id = String(item?.id || index + 1).trim();
+  const label = normalizeText(item?.label || item?.title || item?.name || `Option ${index + 1}`);
+  if (!id || !label) return null;
+  return { id, label };
+}
+
+async function searchMusicSuggestions(query) {
+  const response = await fetch(getSocialDownloaderApiUrl("/api/music/search"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query }),
+    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+  });
+  const payload = await parseApiJson(response);
+  if (!response.ok) {
+    throw new Error(payload?.error || payload?.message || `Music search failed (HTTP ${response.status})`);
+  }
+
+  const sessionId = String(payload?.sessionId || "").trim();
+  if (!sessionId) throw new Error("Music search returned no sessionId");
+
+  const suggestions = (Array.isArray(payload?.suggestions) ? payload.suggestions : [])
+    .map((item, index) => normalizeMusicSuggestion(item, index))
+    .filter(Boolean)
+    .slice(0, 15);
+
+  return {
+    sessionId,
+    query: normalizeText(payload?.query || query),
+    suggestions,
+  };
+}
+
+function buildMusicSuggestionsText(result) {
+  const lines = ["*Music Search Results*", `Query: ${result.query}`, "", "Reply with a number to download:"];
+  for (let i = 0; i < result.suggestions.length; i += 1) {
+    lines.push(`${i + 1}. ${result.suggestions[i].label}`);
+  }
+  lines.push("");
+  lines.push(
+    `Reply with 1-${result.suggestions.length}. Session expires in ~${Math.max(1, Math.round(MUSIC_SELECTION_TTL_MS / 60000))} min.`,
+  );
+  return lines.join("\n");
+}
+
+function resolveMusicSelectionFromInput(pending, rawInput = "") {
+  const input = String(rawInput || "").trim();
+  if (!/^\d+$/.test(input)) return null;
+
+  const byId = pending.suggestions.find((item) => item.id === input);
+  if (byId) return byId;
+
+  const index = Number(input) - 1;
+  if (index >= 0 && index < pending.suggestions.length) return pending.suggestions[index];
+  return null;
+}
+
+async function createMusicDownloadJob(sessionId, optionId) {
+  const response = await fetch(getSocialDownloaderApiUrl("/api/music/download"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId, optionId }),
+    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+  });
+  const payload = await parseApiJson(response);
+  if (!response.ok) {
+    throw new Error(payload?.error || payload?.message || `Music download failed (HTTP ${response.status})`);
+  }
+
+  const id = String(payload?.id || "").trim();
+  if (!id) throw new Error("Music download returned no file id");
+  return {
+    id,
+    selected: normalizeText(payload?.selected || ""),
+    platform: normalizeText(payload?.platform || ""),
+  };
+}
+
+async function handleMusicCommand(client, message, args) {
+  const query = normalizeText(args.join(" "));
+  if (!query) {
+    await message.reply(`Use: ${COMMAND_PREFIX}music <song or artist>`);
+    return;
+  }
+
+  await client.sendMessage(message.from, `Searching music options for: ${query}`);
+  const result = await searchMusicSuggestions(query);
+  if (!result.suggestions.length) {
+    await client.sendMessage(message.from, "No music suggestions found. Try a different query.");
+    return;
+  }
+
+  setPendingMusicSelection(message, result);
+  await sendTextInChunks(client, message.from, buildMusicSuggestionsText(result));
+}
+
+async function handlePendingMusicSelection(client, message) {
+  const pending = getPendingMusicSelection(message);
+  if (!pending) return false;
+
+  const body = String(message.body || "").trim();
+  if (!/^\d+$/.test(body)) return false;
+
+  if (pending.inProgress) {
+    await message.reply("Music download is already in progress for your last choice. Please wait.");
+    return true;
+  }
+
+  const selected = resolveMusicSelectionFromInput(pending, body);
+  if (!selected) {
+    await message.reply(`Invalid option. Reply with a number between 1 and ${pending.suggestions.length}.`);
+    return true;
+  }
+
+  pending.inProgress = true;
+  pendingMusicSelections.set(getMusicSelectionKey(message), pending);
+  await client.sendMessage(message.from, `Downloading: ${selected.label}`);
+
+  try {
+    const download = await createMusicDownloadJob(pending.sessionId, selected.id);
+    await waitForSocialDownloadJob(download.id, {
+      shouldIgnoreProgressError: shouldTreatMusicProgressErrorAsTransient,
+      timeoutMs: MUSIC_DOWNLOAD_TIMEOUT_MS,
+      timeoutMessage: "Music is taking longer than expected. Please try again shortly.",
+    });
+    const label = download.selected || selected.label;
+    await sendDownloadedApiFile(client, message.from, download.id, `Music: ${label}`, { forceDocument: true });
+    clearPendingMusicSelection(message);
+  } catch (error) {
+    pending.inProgress = false;
+    pendingMusicSelections.set(getMusicSelectionKey(message), pending);
+    console.error("Music download flow error:", error);
+    await client.sendMessage(
+      message.from,
+      `Music download failed. Reply with another number, or run ${COMMAND_PREFIX}music <query>.`,
+    );
+  }
+
+  return true;
 }
 
 async function resolveSocialDownloadUrl(message, args) {
@@ -525,19 +750,6 @@ async function handleSocialDownloadCommand(client, message, args) {
 
   const jobId = await createSocialDownloadJob(url);
   await waitForSocialDownloadJob(jobId);
-  const mediaFile = await fetchSocialDownloadFile(jobId);
-
-  if (mediaFile.buffer.length > SOCIAL_DOWNLOADER_MAX_BYTES) {
-    await client.sendMessage(
-      targetJid,
-      `The file is ${formatBytes(mediaFile.buffer.length)}, above current bot media limit (${formatBytes(
-        SOCIAL_DOWNLOADER_MAX_BYTES,
-      )}). Download it directly:\n${mediaFile.fileUrl}`,
-    );
-    return;
-  }
-
-  const media = new MessageMedia(mediaFile.mimeType, mediaFile.buffer.toString("base64"), mediaFile.fileName);
   const sourceHost = (() => {
     try {
       return new URL(url).hostname.replace(/^www\./, "");
@@ -545,17 +757,7 @@ async function handleSocialDownloadCommand(client, message, args) {
       return "source";
     }
   })();
-
-  try {
-    await client.sendMessage(targetJid, media, {
-      caption: `Downloaded from ${sourceHost}`,
-    });
-  } catch {
-    await client.sendMessage(targetJid, media, {
-      sendMediaAsDocument: true,
-      caption: `Downloaded from ${sourceHost}`,
-    });
-  }
+  await sendDownloadedApiFile(client, targetJid, jobId, `Downloaded from ${sourceHost}`);
 }
 
 function getUcaConfig() {
@@ -1673,6 +1875,7 @@ function getHelpText() {
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}sticker / ${COMMAND_PREFIX}s (DM or linked group, send with image/video)`,
     `${COMMAND_PREFIX}download / ${COMMAND_PREFIX}dl <url> (social media video + Pinterest images/videos)`,
+    `${COMMAND_PREFIX}music <query> (search music, then reply with option number)`,
     "",
     "Games:",
     `${COMMAND_PREFIX}mafia help`,
@@ -2134,6 +2337,8 @@ async function handleCommand(client, message) {
   const usesDefaultPrefix = body.startsWith(COMMAND_PREFIX);
   const usesPlusPrefix = body.startsWith("+");
   if (!usesDefaultPrefix && !usesPlusPrefix) {
+    const handledMusicSelection = await handlePendingMusicSelection(client, message);
+    if (handledMusicSelection) return;
     await handlePassiveFlagGuess(client, message);
     return;
   }
@@ -2238,6 +2443,25 @@ async function handleCommand(client, message) {
     } catch (error) {
       await message.reply(`Failed to run ${COMMAND_PREFIX}download: ${getErrorText(error)}`);
       console.error("Social downloader command error:", error);
+    }
+    return;
+  }
+
+  if (command === "music") {
+    if (!isPrivateMessage(message)) {
+      const didBind = await bindTargetGroupIfNeeded(message.from);
+      if (didBind) {
+        await message.reply(`This group is now linked to the bot (${getTargetGroupIds().length}/${MAX_TARGET_GROUPS}).`);
+        await markCurrentMembersAsWelcomed(client);
+      }
+      if (!ensureGroupOnly(message)) return;
+    }
+
+    try {
+      await handleMusicCommand(client, message, parts);
+    } catch (error) {
+      console.error("Music command error:", error);
+      await message.reply("Music service is currently unavailable. Please try again shortly.");
     }
     return;
   }
