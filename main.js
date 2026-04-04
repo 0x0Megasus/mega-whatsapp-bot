@@ -31,6 +31,17 @@ const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOU
 const DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS = Number(process.env.COURCES_DOWNLOAD_TIMEOUT_MS || 120000);
 const WWEBJS_INIT_MAX_RETRIES = Number(process.env.WWEBJS_INIT_MAX_RETRIES || 8);
 const WWEBJS_INIT_RETRY_DELAY_MS = Number(process.env.WWEBJS_INIT_RETRY_DELAY_MS || 5000);
+const SOCIAL_DOWNLOADER_API_BASE = String(
+  process.env.SOCIAL_DOWNLOADER_API_BASE ||
+    process.env.MEGA_VIDEO_DOWNLOADER_API_BASE ||
+    "https://mega-video-downloader-production-6897.up.railway.app",
+)
+  .trim()
+  .replace(/\/+$/, "");
+const SOCIAL_DOWNLOADER_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_TIMEOUT_MS || 120000);
+const SOCIAL_DOWNLOADER_POLL_INTERVAL_MS = Number(process.env.SOCIAL_DOWNLOADER_POLL_INTERVAL_MS || 1200);
+const SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS || 180000);
+const SOCIAL_DOWNLOADER_MAX_BYTES = Number(process.env.SOCIAL_DOWNLOADER_MAX_BYTES || 64 * 1024 * 1024);
 
 function getQrImageUrl(qrText) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(qrText)}`;
@@ -86,6 +97,46 @@ const localFlagBank = [
   {
     code: "DE",
     names: ["germany", "federal republic of germany", "deutschland"],
+  },
+];
+
+const SOCIAL_PLATFORM_PATTERNS = [
+  {
+    name: "YouTube",
+    pattern: /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/i,
+  },
+  {
+    name: "TikTok",
+    pattern: /^(https?:\/\/)?(www\.)?(tiktok\.com|vm\.tiktok\.com)\/.+$/i,
+  },
+  {
+    name: "Instagram",
+    pattern: /^(https?:\/\/)?(www\.)?(instagram\.com)\/.+$/i,
+  },
+  {
+    name: "Facebook",
+    pattern: /^(https?:\/\/)?(www\.)?(facebook\.com|fb\.watch)\/.+$/i,
+  },
+  {
+    name: "Pinterest",
+    pattern:
+      /^(https?:\/\/)?(www\.)?(pin\.it|pinterest\.com|pinterest\.ca|pinterest\.co\.uk|pinterest\.ph|pinterest\.fr|pinterest\.de)\/.+$/i,
+  },
+  {
+    name: "Twitter/X",
+    pattern: /^(https?:\/\/)?(www\.)?(twitter\.com|x\.com)\/.+$/i,
+  },
+  {
+    name: "Reddit",
+    pattern: /^(https?:\/\/)?(www\.)?(reddit\.com)\/.+$/i,
+  },
+  {
+    name: "Vimeo",
+    pattern: /^(https?:\/\/)?(www\.)?(vimeo\.com)\/.+$/i,
+  },
+  {
+    name: "Dailymotion",
+    pattern: /^(https?:\/\/)?(www\.)?(dailymotion\.com)\/.+$/i,
   },
 ];
 
@@ -321,6 +372,190 @@ function isRetryableInitializeError(error) {
 
 function normalizeText(value = "") {
   return String(value).replace(/\s+/g, " ").trim();
+}
+
+function getSocialDownloaderApiUrl(pathname = "") {
+  const normalizedPath = String(pathname || "");
+  if (!normalizedPath) return SOCIAL_DOWNLOADER_API_BASE;
+  return `${SOCIAL_DOWNLOADER_API_BASE}${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}`;
+}
+
+function extractFirstHttpUrl(value = "") {
+  const text = String(value || "");
+  const match = text.match(/https?:\/\/[^\s<>"']+/i);
+  if (!match?.[0]) return "";
+  return match[0].replace(/[),.!?]+$/g, "");
+}
+
+function isHttpUrl(value = "") {
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function detectSocialPlatform(url = "") {
+  const normalized = String(url || "").trim();
+  const matched = SOCIAL_PLATFORM_PATTERNS.find((entry) => entry.pattern.test(normalized));
+  return matched?.name || "social media";
+}
+
+async function parseApiJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+function formatBytes(bytes = 0) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  const kb = value / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
+function extensionFromMimeType(mimeType = "") {
+  const clean = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  if (!clean.includes("/")) return "bin";
+  const [, subtype] = clean.split("/");
+  if (!subtype) return "bin";
+  return subtype.split("+")[0].replace(/^x-/, "").replace(/[^\w-]/g, "") || "bin";
+}
+
+async function createSocialDownloadJob(url) {
+  const response = await fetch(getSocialDownloaderApiUrl("/api/download"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url }),
+    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+  });
+  const payload = await parseApiJson(response);
+  if (!response.ok) {
+    throw new Error(payload?.error || payload?.message || `Downloader API error (HTTP ${response.status})`);
+  }
+
+  const id = String(payload?.id || "").trim();
+  if (!id) throw new Error("Downloader API returned no job id");
+  return id;
+}
+
+async function waitForSocialDownloadJob(jobId) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < SOCIAL_DOWNLOADER_TIMEOUT_MS) {
+    const response = await fetch(getSocialDownloaderApiUrl(`/api/progress/${encodeURIComponent(jobId)}`), {
+      method: "GET",
+      signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+    });
+    const payload = await parseApiJson(response);
+    if (response.ok) {
+      const progress = Number(payload?.progress);
+      if (Number.isFinite(progress)) {
+        if (progress === -1) {
+          throw new Error(payload?.error || "Download failed");
+        }
+        if (progress >= 100) {
+          return;
+        }
+      }
+    }
+    await delay(SOCIAL_DOWNLOADER_POLL_INTERVAL_MS);
+  }
+
+  throw new Error("Download timed out. Try again with another link.");
+}
+
+async function fetchSocialDownloadFile(jobId) {
+  const fileUrl = getSocialDownloaderApiUrl(`/api/file/${encodeURIComponent(jobId)}`);
+  const response = await fetch(fileUrl, {
+    method: "GET",
+    redirect: "follow",
+    signal: AbortSignal.timeout(SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const payload = await parseApiJson(response);
+    throw new Error(payload?.error || payload?.message || `File fetch failed (HTTP ${response.status})`);
+  }
+
+  const mimeType = String(response.headers.get("content-type") || "application/octet-stream")
+    .split(";")[0]
+    .trim();
+  const disposition = response.headers.get("content-disposition") || "";
+  const fallbackName = sanitizeFileName(`download-${jobId}.${extensionFromMimeType(mimeType)}`);
+  const fileName = fileNameFromContentDisposition(disposition) || fallbackName;
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return { mimeType, fileName, buffer, fileUrl };
+}
+
+async function resolveSocialDownloadUrl(message, args) {
+  const argsUrl = extractFirstHttpUrl(args.join(" "));
+  if (isHttpUrl(argsUrl)) return argsUrl;
+
+  if (message.hasQuotedMsg) {
+    try {
+      const quoted = await message.getQuotedMessage();
+      const quotedUrl = extractFirstHttpUrl(quoted?.body || "");
+      if (isHttpUrl(quotedUrl)) return quotedUrl;
+    } catch {
+      // Ignore quoted-message lookup failures.
+    }
+  }
+
+  return "";
+}
+
+async function handleSocialDownloadCommand(client, message, args) {
+  const targetJid = message.from;
+  const url = await resolveSocialDownloadUrl(message, args);
+  if (!url) {
+    await message.reply(`Use: ${COMMAND_PREFIX}download <url>\nOr reply to a message that contains a URL.`);
+    return;
+  }
+
+  const platform = detectSocialPlatform(url);
+  await client.sendMessage(targetJid, `Processing ${platform} link, please wait...`);
+
+  const jobId = await createSocialDownloadJob(url);
+  await waitForSocialDownloadJob(jobId);
+  const mediaFile = await fetchSocialDownloadFile(jobId);
+
+  if (mediaFile.buffer.length > SOCIAL_DOWNLOADER_MAX_BYTES) {
+    await client.sendMessage(
+      targetJid,
+      `The file is ${formatBytes(mediaFile.buffer.length)}, above current bot media limit (${formatBytes(
+        SOCIAL_DOWNLOADER_MAX_BYTES,
+      )}). Download it directly:\n${mediaFile.fileUrl}`,
+    );
+    return;
+  }
+
+  const media = new MessageMedia(mediaFile.mimeType, mediaFile.buffer.toString("base64"), mediaFile.fileName);
+  const sourceHost = (() => {
+    try {
+      return new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+      return "source";
+    }
+  })();
+
+  try {
+    await client.sendMessage(targetJid, media, {
+      caption: `Downloaded from ${sourceHost}`,
+    });
+  } catch {
+    await client.sendMessage(targetJid, media, {
+      sendMediaAsDocument: true,
+      caption: `Downloaded from ${sourceHost}`,
+    });
+  }
 }
 
 function getUcaConfig() {
@@ -1437,6 +1672,7 @@ function getHelpText() {
     "Core Commands:",
     `${COMMAND_PREFIX}help`,
     `${COMMAND_PREFIX}sticker / ${COMMAND_PREFIX}s (DM or linked group, send with image/video)`,
+    `${COMMAND_PREFIX}download / ${COMMAND_PREFIX}dl <url> (social media video + Pinterest images/videos)`,
     "",
     "Games:",
     `${COMMAND_PREFIX}mafia help`,
@@ -1983,6 +2219,25 @@ async function handleCommand(client, message) {
     } catch (error) {
       await message.reply(`Failed to run ${COMMAND_PREFIX}cources: ${getErrorText(error)}`);
       console.error("Cources command error:", error);
+    }
+    return;
+  }
+
+  if (command === "download" || command === "dl") {
+    if (!isPrivateMessage(message)) {
+      const didBind = await bindTargetGroupIfNeeded(message.from);
+      if (didBind) {
+        await message.reply(`This group is now linked to the bot (${getTargetGroupIds().length}/${MAX_TARGET_GROUPS}).`);
+        await markCurrentMembersAsWelcomed(client);
+      }
+      if (!ensureGroupOnly(message)) return;
+    }
+
+    try {
+      await handleSocialDownloadCommand(client, message, parts);
+    } catch (error) {
+      await message.reply(`Failed to run ${COMMAND_PREFIX}download: ${getErrorText(error)}`);
+      console.error("Social downloader command error:", error);
     }
     return;
   }
