@@ -32,13 +32,15 @@ const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOU
 const DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS = Number(process.env.COURCES_DOWNLOAD_TIMEOUT_MS || 120000);
 const WWEBJS_INIT_MAX_RETRIES = Number(process.env.WWEBJS_INIT_MAX_RETRIES || 8);
 const WWEBJS_INIT_RETRY_DELAY_MS = Number(process.env.WWEBJS_INIT_RETRY_DELAY_MS || 5000);
-const SOCIAL_DOWNLOADER_API_BASE = String(
-  process.env.SOCIAL_DOWNLOADER_API_BASE ||
-    process.env.MEGA_VIDEO_DOWNLOADER_API_BASE ||
-    "https://mega-video-downloader-production-6897.up.railway.app",
-)
-  .trim()
-  .replace(/\/+$/, "");
+const DEFAULT_SOCIAL_DOWNLOADER_API_BASE = "https://mega-video-downloader-production-6897.up.railway.app";
+const SOCIAL_DOWNLOADER_API_BASE = normalizeApiBase(
+  process.env.SOCIAL_DOWNLOADER_API_BASE || process.env.MEGA_VIDEO_DOWNLOADER_API_BASE || DEFAULT_SOCIAL_DOWNLOADER_API_BASE,
+);
+const MUSIC_API_BASE = normalizeApiBase(process.env.MUSIC_API_BASE || SOCIAL_DOWNLOADER_API_BASE);
+const MUSIC_SEARCH_PATH = normalizeApiPath(process.env.MUSIC_SEARCH_PATH || process.env.MUSIC_SEARCH_ENDPOINT || "/api/music/search");
+const MUSIC_DOWNLOAD_PATH = normalizeApiPath(
+  process.env.MUSIC_DOWNLOAD_PATH || process.env.MUSIC_DOWNLOAD_ENDPOINT || "/api/music/download",
+);
 const SOCIAL_DOWNLOADER_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_TIMEOUT_MS || 120000);
 const SOCIAL_DOWNLOADER_POLL_INTERVAL_MS = Number(process.env.SOCIAL_DOWNLOADER_POLL_INTERVAL_MS || 1200);
 const SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS || 180000);
@@ -377,10 +379,49 @@ function normalizeText(value = "") {
   return String(value).replace(/\s+/g, " ").trim();
 }
 
+function normalizeApiBase(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  return withProtocol.replace(/\/+$/, "");
+}
+
+function normalizeApiPath(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.startsWith("/") ? raw : `/${raw}`;
+}
+
+function resolveKnownApiBaseAlias(baseUrl = "") {
+  const normalizedBase = normalizeApiBase(baseUrl);
+  if (!normalizedBase) return normalizedBase;
+  try {
+    const parsed = new URL(normalizedBase);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const isFrontendHost = host === "mega-video-downloader.vercel.app" || host === "www.mega-video-downloader.vercel.app";
+    if (isFrontendHost && (!pathname || pathname === "/" || pathname === "/api")) {
+      return DEFAULT_SOCIAL_DOWNLOADER_API_BASE;
+    }
+  } catch {
+    // If parsing fails, keep the configured base as-is.
+  }
+  return normalizedBase;
+}
+
+function buildApiUrl(baseUrl, pathname = "") {
+  const resolvedBase = resolveKnownApiBaseAlias(baseUrl);
+  const normalizedPath = normalizeApiPath(pathname);
+  if (!normalizedPath) return resolvedBase;
+  return `${resolvedBase}${normalizedPath}`;
+}
+
 function getSocialDownloaderApiUrl(pathname = "") {
-  const normalizedPath = String(pathname || "");
-  if (!normalizedPath) return SOCIAL_DOWNLOADER_API_BASE;
-  return `${SOCIAL_DOWNLOADER_API_BASE}${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}`;
+  return buildApiUrl(SOCIAL_DOWNLOADER_API_BASE, pathname);
+}
+
+function getMusicApiUrl(pathname = "") {
+  return buildApiUrl(MUSIC_API_BASE, pathname);
 }
 
 function extractFirstHttpUrl(value = "") {
@@ -582,7 +623,8 @@ function normalizeMusicSuggestion(item, index) {
 }
 
 async function searchMusicSuggestions(query) {
-  const response = await fetch(getSocialDownloaderApiUrl("/api/music/search"), {
+  const apiUrl = getMusicApiUrl(MUSIC_SEARCH_PATH);
+  const response = await fetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -592,11 +634,11 @@ async function searchMusicSuggestions(query) {
   });
   const payload = await parseApiJson(response);
   if (!response.ok) {
-    throw new Error(payload?.error || payload?.message || `Music search failed (HTTP ${response.status})`);
+    throw new Error(payload?.error || payload?.message || `Music search failed (HTTP ${response.status}) at ${apiUrl}`);
   }
 
   const sessionId = String(payload?.sessionId || "").trim();
-  if (!sessionId) throw new Error("Music search returned no sessionId");
+  if (!sessionId) throw new Error(`Music search returned no sessionId from ${apiUrl}`);
 
   const suggestions = (Array.isArray(payload?.suggestions) ? payload.suggestions : [])
     .map((item, index) => normalizeMusicSuggestion(item, index))
@@ -635,7 +677,8 @@ function resolveMusicSelectionFromInput(pending, rawInput = "") {
 }
 
 async function createMusicDownloadJob(sessionId, optionId) {
-  const response = await fetch(getSocialDownloaderApiUrl("/api/music/download"), {
+  const apiUrl = getMusicApiUrl(MUSIC_DOWNLOAD_PATH);
+  const response = await fetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -645,11 +688,11 @@ async function createMusicDownloadJob(sessionId, optionId) {
   });
   const payload = await parseApiJson(response);
   if (!response.ok) {
-    throw new Error(payload?.error || payload?.message || `Music download failed (HTTP ${response.status})`);
+    throw new Error(payload?.error || payload?.message || `Music download failed (HTTP ${response.status}) at ${apiUrl}`);
   }
 
   const id = String(payload?.id || "").trim();
-  if (!id) throw new Error("Music download returned no file id");
+  if (!id) throw new Error(`Music download returned no file id from ${apiUrl}`);
   return {
     id,
     selected: normalizeText(payload?.selected || ""),
@@ -2461,7 +2504,7 @@ async function handleCommand(client, message) {
       await handleMusicCommand(client, message, parts);
     } catch (error) {
       console.error("Music command error:", error);
-      await message.reply("Music service is currently unavailable. Please try again shortly.");
+      await message.reply(`Failed to run ${COMMAND_PREFIX}music: ${getErrorText(error)}`);
     }
     return;
   }
