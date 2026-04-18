@@ -43,6 +43,15 @@ const MUSIC_DOWNLOAD_PATH = normalizeApiPath(
   process.env.MUSIC_DOWNLOAD_PATH || process.env.MUSIC_DOWNLOAD_ENDPOINT || "/api/music/download",
 );
 const SOCIAL_DOWNLOADER_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_TIMEOUT_MS || 120000);
+
+const USING_DEFAULT_DOWNLOADER_BASE = !process.env.SOCIAL_DOWNLOADER_API_BASE && !process.env.MEGA_VIDEO_DOWNLOADER_API_BASE;
+const USING_DEFAULT_MUSIC_BASE = !process.env.MUSIC_API_BASE;
+
+if (USING_DEFAULT_DOWNLOADER_BASE || USING_DEFAULT_MUSIC_BASE) {
+  console.warn(
+    "Warning: no MUSIC_API_BASE or SOCIAL_DOWNLOADER_API_BASE configured. Music and downloader commands may use an outdated default service and may fail.",
+  );
+}
 const SOCIAL_DOWNLOADER_POLL_INTERVAL_MS = Number(process.env.SOCIAL_DOWNLOADER_POLL_INTERVAL_MS || 1200);
 const SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS = Number(process.env.SOCIAL_DOWNLOADER_FETCH_TIMEOUT_MS || 180000);
 const SOCIAL_DOWNLOADER_MAX_BYTES = Number(process.env.SOCIAL_DOWNLOADER_MAX_BYTES || 64 * 1024 * 1024);
@@ -422,6 +431,16 @@ function normalizeApiPath(value = "") {
   return raw.startsWith("/") ? raw : `/${raw}`;
 }
 
+function isDefaultDownloaderApiUrl(url = "") {
+  return normalizeApiBase(url) === normalizeApiBase(DEFAULT_SOCIAL_DOWNLOADER_API_BASE);
+}
+
+function buildApiUnavailableError(operationLabel, apiUrl) {
+  return new Error(
+    `${operationLabel} service unavailable. Set MUSIC_API_BASE or SOCIAL_DOWNLOADER_API_BASE to a working downloader API base URL. Current URL: ${apiUrl}`,
+  );
+}
+
 function resolveKnownApiBaseAlias(baseUrl = "") {
   const normalizedBase = normalizeApiBase(baseUrl);
   if (!normalizedBase) return normalizedBase;
@@ -525,8 +544,16 @@ async function postMusicApiJson(pathname, body, operationLabel) {
       const payload = await parseApiJson(response);
       if (response.ok) return { payload, apiUrl };
 
+      const errorText = String(payload?.error || payload?.message || "").trim();
+      if (
+        errorText.toLowerCase().includes("application not found") ||
+        (response.status === 404 && isDefaultDownloaderApiUrl(apiUrl))
+      ) {
+        throw buildApiUnavailableError(operationLabel, apiUrl);
+      }
+
       const statusError = new Error(
-        payload?.error || payload?.message || `${operationLabel} failed (HTTP ${response.status}) at ${apiUrl}`,
+        errorText || `${operationLabel} failed (HTTP ${response.status}) at ${apiUrl}`,
       );
       if (attempt < MUSIC_API_MAX_ATTEMPTS && isRetryableMusicStatus(response.status)) {
         await delay(MUSIC_API_RETRY_DELAY_MS * attempt);
@@ -575,7 +602,8 @@ function extensionFromMimeType(mimeType = "") {
 }
 
 async function createSocialDownloadJob(url) {
-  const response = await fetch(getSocialDownloaderApiUrl("/api/download"), {
+  const apiUrl = getSocialDownloaderApiUrl("/api/download");
+  const response = await fetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -585,6 +613,10 @@ async function createSocialDownloadJob(url) {
   });
   const payload = await parseApiJson(response);
   if (!response.ok) {
+    const errorText = String(payload?.error || payload?.message || "").trim();
+    if (errorText.toLowerCase().includes("application not found") || response.status === 404) {
+      throw buildApiUnavailableError("Downloader", apiUrl);
+    }
     throw new Error(payload?.error || payload?.message || `Downloader API error (HTTP ${response.status})`);
   }
 
