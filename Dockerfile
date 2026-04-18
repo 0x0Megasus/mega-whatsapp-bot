@@ -15,4 +15,4 @@ RUN npm ci --omit=dev
 
 COPY . .
 
-CMD ["npm", "start"]
+CMD ["node", "--max-old-space-size=384", "main.js"]

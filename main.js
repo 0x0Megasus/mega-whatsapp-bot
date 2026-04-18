@@ -18,7 +18,8 @@ try {
 const ENV_TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
 const MAX_TARGET_GROUPS = 4;
 const COMMAND_PREFIX = process.env.COMMAND_PREFIX || ".";
-const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DEFAULT_PERSISTENT_DATA_DIR = "/data";
+const DATA_DIR = process.env.DATA_DIR || (fsSync.existsSync(DEFAULT_PERSISTENT_DATA_DIR) ? DEFAULT_PERSISTENT_DATA_DIR : __dirname);
 const STORE_FILE = path.join(DATA_DIR, "bot-store.json");
 const COURSE_DOWNLOAD_DIR = process.env.COURSE_DOWNLOAD_DIR || path.join(DATA_DIR, "cources-downloads");
 const ADMIN_JIDS = new Set(["212704588420@c.us"]);
@@ -365,6 +366,26 @@ function getErrorText(error) {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+  process.exit(1);
+});
+
+process.on("SIGINT", () => {
+  console.log("SIGINT received, shutting down gracefully.");
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received, shutting down gracefully.");
+  process.exit(0);
+});
 
 function isRetryableInitializeError(error) {
   const text = getErrorText(error).toLowerCase();
@@ -2722,7 +2743,20 @@ async function start() {
       puppeteer: {
         headless: true,
         executablePath: puppeteer.executablePath(),
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--single-process",
+          "--no-zygote",
+          "--disable-background-networking",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-extensions",
+          "--disable-default-apps",
+          "--mute-audio",
+        ],
       },
     });
 
@@ -2777,7 +2811,18 @@ async function start() {
   }
 }
 
-start().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+async function runApp() {
+  while (true) {
+    try {
+      await start();
+      console.log("Startup complete. Bot is running.");
+      break;
+    } catch (error) {
+      console.error("Fatal startup error:", error);
+      console.log("Retrying app startup in 10 seconds...");
+      await delay(10000);
+    }
+  }
+}
+
+runApp();
