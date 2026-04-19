@@ -33,7 +33,7 @@ const DEFAULT_COURCES_FETCH_TIMEOUT_MS = Number(process.env.COURCES_FETCH_TIMEOU
 const DEFAULT_COURCES_DOWNLOAD_TIMEOUT_MS = Number(process.env.COURCES_DOWNLOAD_TIMEOUT_MS || 120000);
 const WWEBJS_INIT_MAX_RETRIES = Number(process.env.WWEBJS_INIT_MAX_RETRIES || 8);
 const WWEBJS_INIT_RETRY_DELAY_MS = Number(process.env.WWEBJS_INIT_RETRY_DELAY_MS || 5000);
-const DEFAULT_SOCIAL_DOWNLOADER_API_BASE = "https://mega-video-downloader-production-6897.up.railway.app";
+const DEFAULT_SOCIAL_DOWNLOADER_API_BASE = "mega-video-downloader-production-ae00.up.railway.app";
 const SOCIAL_DOWNLOADER_API_BASE = normalizeApiBase(
   process.env.SOCIAL_DOWNLOADER_API_BASE || process.env.MEGA_VIDEO_DOWNLOADER_API_BASE || DEFAULT_SOCIAL_DOWNLOADER_API_BASE,
 );
