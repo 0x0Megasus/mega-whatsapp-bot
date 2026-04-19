@@ -450,7 +450,7 @@ function resolveKnownApiBaseAlias(baseUrl = "") {
     const pathname = parsed.pathname.replace(/\/+$/, "");
     const isFrontendHost = host === "mega-video-downloader.vercel.app" || host === "www.mega-video-downloader.vercel.app";
     if (isFrontendHost && (!pathname || pathname === "/" || pathname === "/api")) {
-      return DEFAULT_SOCIAL_DOWNLOADER_API_BASE;
+      return normalizeApiBase(DEFAULT_SOCIAL_DOWNLOADER_API_BASE);
     }
   } catch {
     // If parsing fails, keep the configured base as-is.
